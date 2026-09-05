@@ -60,16 +60,29 @@ export const app = {
 /* ---------- boot ---------- */
 async function boot() {
   await ready;
+  let info = null;
   try {
-    const info = await api.bootstrap();
-    app.settings = info.settings || {};
-    app.user = info.user || null;
-    app.flags = { stock: !!info.track_stock, khata: !!info.track_khata };
-    app.can = info.can || {};       // what security.py says this user may do
+    info = await api.bootstrap();
   } catch (e) {
-    app.settings = { store_name: 'Balaji Store' };
-    app.can = {};
+    info = null;
   }
+
+  if (info?.needs_auth) {
+    // The database says sign-in is required and nobody is authenticated
+    // yet - clear the splash screen and gate on a real sign-in form
+    // rather than falling through to the dashboard (which is exactly
+    // what used to happen here, silently, before this existed).
+    q('#splash')?.classList.add('gone');
+    setTimeout(() => q('#splash')?.remove(), 500);
+    await signInGate(info);
+    try { info = await api.bootstrap(); } catch (e) { /* keep prior info */ }
+  }
+
+  app.settings = info?.settings || { store_name: 'Balaji Store' };
+  app.user = info?.user || null;
+  app.flags = { stock: !!info?.track_stock, khata: !!info?.track_khata };
+  app.can = info?.can || {};       // what security.py says this user may do
+
   window.__novaBooted = true;      // tells index.html's watchdog we're alive
   render();
   await go(prefs.get('lastView', 'dashboard'));
@@ -82,6 +95,67 @@ async function boot() {
   // background thread throttled to once every 24h). The delay just lets
   // the splash screen clear first.
   setTimeout(() => notifyIfPending(app), 2500);
+}
+
+/** Fills #app with a full-screen sign-in form and resolves once
+ * api.sign_in() succeeds. Nothing else in the app is reachable while
+ * this is showing - there is no "skip" path, matching what "Require
+ * sign-in" is supposed to mean. */
+function signInGate(info) {
+  const shop = info?.settings?.store_name || 'Balaji Store';
+  return new Promise((resolve) => {
+    document.getElementById('app').innerHTML = `
+      <div class="signin">
+        <div class="signin-brand">
+          <div class="glow1"></div><div class="glow2"></div>
+          <div class="row gap2" style="align-items:center;position:relative;color:#fff">
+            <div class="brand-mark">${icon('box', 18)}</div>
+            <div style="font-weight:650;font-size:15px">Vikray</div>
+          </div>
+          <div style="position:relative">
+            <div style="color:#fff;font-size:26px;font-weight:650;margin-bottom:8px">${esc(shop)}</div>
+            <div class="small" style="color:rgba(255,255,255,.65)">
+              Sign-in is required for this shop. Ask the owner if you don't have an account yet.
+            </div>
+          </div>
+        </div>
+        <div class="signin-form">
+          <form id="signinForm" class="col gap3" style="width:100%;max-width:320px">
+            <div class="h2">Sign in</div>
+            <div class="field">
+              <label class="label">Username</label>
+              <input class="input" id="si-user" name="username" autocomplete="username" autofocus required>
+            </div>
+            <div class="field">
+              <label class="label">Password</label>
+              <input class="input" id="si-pass" name="password" type="password" autocomplete="current-password" required>
+            </div>
+            <div class="small" style="color:var(--bad)" id="si-err" hidden></div>
+            <button class="btn btn-primary" type="submit" style="justify-content:center">Sign in</button>
+          </form>
+        </div>
+      </div>`;
+
+    const form = q('#signinForm');
+    const err = q('#si-err');
+    const btn = form.querySelector('button[type=submit]');
+
+    form.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      err.hidden = true;
+      btn.disabled = true;
+      try {
+        await api.sign_in(q('#si-user').value.trim(), q('#si-pass').value);
+        resolve();
+      } catch (ex) {
+        err.textContent = ex.message || 'That username or password is not right.';
+        err.hidden = false;
+        btn.disabled = false;
+        q('#si-pass').value = '';
+        q('#si-pass').focus();
+      }
+    });
+  });
 }
 
 /* ---------- shell ---------- */
