@@ -34,7 +34,7 @@ Renaming the product is a one-line change here and nowhere else.
 APP_NAME = "Vikray"
 APP_TAGLINE = "Billing & Inventory"
 APP_LEGAL_NAME = "Vikray Retail Software"
-APP_VERSION = "3.0"
+APP_VERSION = "3.0.1"
 
 # Shown in the About box and the sign-in footer.
 APP_DESCRIPTION = (
