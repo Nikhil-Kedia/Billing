@@ -29,12 +29,6 @@ echo     VIKRAY  -  Release %VERSION%
 echo   ==========================================
 echo.
 
-echo %VERSION%| findstr /r "^[0-9][0-9]*\.[0-9][0-9]*\(\.[0-9][0-9]*\)\?$" >nul
-if errorlevel 1 (
-    echo   [X] Version must look like 3.1 or 3.1.2 - got "%VERSION%"
-    goto :fail
-)
-
 if not exist ".venv\Scripts\python.exe" (
     echo   [X] No build environment found yet. Run BUILD.bat once first,
     echo       then run RELEASE.bat again.
