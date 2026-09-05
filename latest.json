@@ -2,9 +2,9 @@
   "version": "3.0",
   "released": "2026-09-05",
   "url": "https://github.com/Nikhil-Kedia/Billing/releases/download/v3.0/Vikray-Setup-3.0.exe",
-  "sha256": "9fd052cce2c9faa727e417140a3811eb92817b337ab521583b10c1eb20c29d37",
-  "size": 22725388,
-  "notes": "• Auto-update support\n• Database schema safety guard\n• Phase 0-2 and 6a complete",
-  "min_version": "2.0",
+  "sha256": "381e28d7b2eda45787a8d1eab9b6aac319fb65e3392db01ab22be85c5a712f63",
+  "size": 22733643,
+  "notes": "Auto-update engine, Settings UI, and one-command releases",
+  "min_version": "3.0",
   "mandatory": false
 }
