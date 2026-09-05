@@ -215,7 +215,7 @@ async function openMonthPicker() {
 /* ============================ layout ============================ */
 function paint(root) {
   root.innerHTML = `
-  <div class="col grow gap4" style="padding:var(--s4) var(--s5) var(--s5);min-height:0">
+  <div class="col grow gap4 scroll-y" style="padding:var(--s4) var(--s5) var(--s5);min-height:0">
     <div class="kpis stagger" id="kpis"></div>
 
     <div class="split split-v grow" data-split="dashboard.custom">
