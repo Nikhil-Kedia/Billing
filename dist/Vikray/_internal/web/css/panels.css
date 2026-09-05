@@ -1,0 +1,149 @@
+/* ============================================================
+   Nova Light — SPLIT PANELS
+   Every boundary between two boxes in this app is a live edge:
+   drag it to resize, click its grip (or double-click the line)
+   to collapse the panel away and bring it back.
+   Works on both axes: .split-h (drag left/right), .split-v (up/down).
+   ============================================================ */
+
+.split { display: flex; min-width: 0; min-height: 0; }
+.split-h { flex-direction: row; }
+.split-v { flex-direction: column; }
+
+.pane {
+  position: relative;
+  min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+}
+
+/* The pane that owns an explicit size; its sibling takes the rest. */
+.pane-sized { flex: 0 0 auto; }
+.split-h > .pane-sized { width: var(--basis, 300px); }
+.split-v > .pane-sized { height: var(--basis, 240px); }
+.pane-fill { flex: 1 1 auto; }
+
+/* Animate size changes, except while a drag is in flight. */
+.split-h > .pane-sized { transition: width var(--slow) var(--ease-out); }
+.split-v > .pane-sized { transition: height var(--slow) var(--ease-out); }
+body.is-dragging .pane-sized { transition: none !important; }
+body.is-dragging { cursor: inherit; user-select: none; }
+body.is-dragging.drag-x, body.is-dragging.drag-x * { cursor: col-resize !important; }
+body.is-dragging.drag-y, body.is-dragging.drag-y * { cursor: row-resize !important; }
+
+/* — collapsed ————————————————————————————— */
+.split-h > .pane-sized.is-collapsed { width: 0 !important; }
+.split-v > .pane-sized.is-collapsed { height: 0 !important; }
+.pane-sized.is-collapsed > * {
+  opacity: 0;
+  visibility: hidden;                 /* also takes it out of the tab order —
+                                         a hidden panel must not be reachable
+                                         by keyboard or screen reader */
+  pointer-events: none;
+  transition: opacity var(--fast) var(--ease), visibility 0s linear var(--fast);
+}
+.pane-sized > * {
+  opacity: 1; visibility: visible;
+  transition: opacity var(--mid) var(--ease) var(--fast), visibility 0s;
+}
+.pane.is-collapsed { overflow: hidden; }
+
+/* ============================================================
+   The splitter itself
+   A hairline you can actually grab: 1px of ink, 10px of target.
+   ============================================================ */
+.splitter {
+  position: relative;
+  flex: none;
+  background: transparent;
+  z-index: 5;
+  touch-action: none;
+}
+.split-h > .splitter { width: var(--split-hit); margin: 0 -4px; cursor: col-resize; }
+.split-v > .splitter { height: var(--split-hit); margin: -4px 0; cursor: row-resize; }
+
+/* the visible hairline */
+.splitter::before {
+  content: "";
+  position: absolute;
+  background: var(--line);
+  transition: background var(--fast) var(--ease), transform var(--fast) var(--ease);
+}
+.split-h > .splitter::before { top: 0; bottom: 0; left: 50%; width: 1px; transform: translateX(-.5px); }
+.split-v > .splitter::before { left: 0; right: 0; top: 50%; height: 1px; transform: translateY(-.5px); }
+
+.splitter:hover::before, .splitter.is-active::before { background: var(--accent); }
+.split-h > .splitter:hover::before, .split-h > .splitter.is-active::before { transform: translateX(-1px) scaleX(2); }
+.split-v > .splitter:hover::before, .split-v > .splitter.is-active::before { transform: translateY(-1px) scaleY(2); }
+
+/* — the grip: appears on hover, always there on keyboard focus — */
+.grip {
+  position: absolute;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--r-pill);
+  color: var(--ink-4);
+  box-shadow: var(--sh-1);
+  opacity: 0;
+  transition: opacity var(--mid) var(--ease), color var(--fast) var(--ease),
+              border-color var(--fast) var(--ease), transform var(--mid) var(--ease-spring),
+              background var(--fast) var(--ease);
+  cursor: pointer;
+}
+.split-h > .splitter > .grip {
+  width: 15px; height: 34px;
+  top: 50%; left: 50%; transform: translate(-50%, -50%) scale(.85);
+}
+.split-v > .splitter > .grip {
+  width: 34px; height: 15px;
+  left: 50%; top: 50%; transform: translate(-50%, -50%) scale(.85);
+}
+.splitter:hover > .grip,
+.splitter:focus-within > .grip,
+.splitter.is-active > .grip { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.grip:hover { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.grip:active { transform: translate(-50%, -50%) scale(.92); }
+
+/* A collapsed panel keeps its grip permanently visible, so the panel
+   is always findable again — a hidden panel with a hidden handle is a
+   panel the user has lost. */
+.splitter.is-parked > .grip { opacity: 1; transform: translate(-50%, -50%) scale(1); }
+.splitter.is-parked::before { background: var(--line-strong); }
+
+/* the chevrons inside the grip rotate to point where the click leads */
+.grip svg { transition: transform var(--slow) var(--ease-spring); }
+.splitter.is-parked .grip svg { transform: rotate(180deg); }
+.split-v > .splitter .grip svg { transform: rotate(90deg); }
+.split-v > .splitter.is-parked .grip svg { transform: rotate(270deg); }
+
+/* Double-click hint */
+.splitter[title] { }
+
+/* ============================================================
+   Panel chrome — the box a pane usually contains
+   ============================================================ */
+.panel {
+  display: flex; flex-direction: column;
+  min-width: 0; min-height: 0;
+  background: var(--surface);
+  border: 1px solid var(--line);
+  border-radius: var(--r-xl);
+  box-shadow: var(--sh-1);
+  overflow: hidden;
+}
+.panel-head {
+  flex: none;
+  display: flex; align-items: center; gap: var(--s2);
+  padding: var(--s3) var(--s4);
+  border-bottom: 1px solid var(--line-soft);
+  min-height: 46px;
+}
+.panel-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
+.panel-foot {
+  flex: none; padding: var(--s3) var(--s4);
+  border-top: 1px solid var(--line-soft);
+  background: var(--surface);
+}
+
+/* A pane collapsed to nothing still needs to not clip its own shadow. */
+.pane > .panel { height: 100%; }

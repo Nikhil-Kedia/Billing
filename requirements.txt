@@ -1,0 +1,21 @@
+# Balaji Billing (Nova rewrite) - Python dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# selenium is optional - only needed for the "Send on WhatsApp" button
+# (whatsapp_sender.py automates a real Chrome browser via Selenium). The
+# app works fully without it; sending on WhatsApp will just show a
+# friendly error until it (and a Chrome/Chromedriver install) is present.
+
+pywebview>=4.4.1        # the desktop window + WebView2 host and JS<->Python bridge
+pythonnet>=3.0.3        # what pywebview talks to WebView2 through on Windows;
+#                       # named explicitly so the build never depends on it
+#                       # arriving as somebody else's transitive dependency
+reportlab>=4.0.0        # bill PDF generation (pdf_generator.py)
+pillow>=10.0.0          # reportlab imports PIL on import; safe_paths.py also
+#                       # uses it to check a logo file is a real image
+openpyxl>=3.1.0         # .xlsx read/write for inventory import/export (inventory_io.py)
+cryptography>=42.0.0    # AES-256-GCM password-protected backups (backup_crypto.py)
+# selenium>=4.15.0      # optional: uncomment for "Send on WhatsApp" (also
+#                       # remove 'selenium' from excludes in build/nova.spec)
+pyinstaller>=6.3.0      # builds the one-file/one-folder Windows .exe
