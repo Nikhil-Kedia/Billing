@@ -4,6 +4,7 @@
 
 import { api, ready, usingMock } from './api.js';
 import * as Panels from './panels.js';
+import { notifyIfPending } from './updates.js';
 import {
   q, qa, el, node, on, esc, icon, toast, modal, confirm, prefs,
   initials, debounce, mark, sleep,
@@ -74,6 +75,13 @@ async function boot() {
   await go(prefs.get('lastView', 'dashboard'));
   q('#splash')?.classList.add('gone');
   setTimeout(() => q('#splash')?.remove(), 500);
+
+  // Phase 3: a quiet startup update check. This makes no network call of
+  // its own - it only asks what the background check already found (see
+  // bridge.check_for_updates_background(), which nova.py runs on a
+  // background thread throttled to once every 24h). The delay just lets
+  // the splash screen clear first.
+  setTimeout(() => notifyIfPending(app), 2500);
 }
 
 /* ---------- shell ---------- */
@@ -101,8 +109,10 @@ function render() {
       <nav class="nav" id="nav"></nav>
 
       <div class="side-foot">
-        <button class="nav-item" data-nav="settings">
+        <button class="nav-item" data-nav="settings" style="position:relative">
           ${icon('gear', 18)}<span class="nav-label grow" style="text-align:left">Settings</span>
+          <span id="updDot" hidden style="position:absolute;left:20px;top:8px;width:8px;height:8px;
+            border-radius:50%;background:var(--accent,#4a7dfc);box-shadow:0 0 0 2px var(--bg,#fff)"></span>
         </button>
         <div class="divider" style="margin:8px 0"></div>
         <button class="who" id="who">

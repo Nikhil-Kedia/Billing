@@ -87,6 +87,8 @@ import subprocess
 import functools
 import calendar
 import csv
+import threading
+import time
 from datetime import datetime, date, timedelta
 from decimal import Decimal
 
@@ -102,6 +104,7 @@ import auto_backup
 import backup_restore as br
 import backup_crypto
 import inventory_io
+import updater
 
 
 def pdf_generator():
@@ -266,6 +269,38 @@ def _all_settings():
         return {r["key"]: r["value"] for r in rows}
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------
+# Auto-update (Phase 2/3) - shared state between the quiet background
+# check nova.py runs on startup and the Settings screen, so both agree
+# on what was found without the UI ever making its own network call.
+# ---------------------------------------------------------------------
+
+_update_lock = threading.Lock()
+_update_state = {
+    "info": None,             # the feed dict once an update is known, else None
+    "downloading": False,
+    "downloaded": 0,
+    "total": 0,
+    "installer_path": None,
+    "error": None,
+}
+
+
+def check_for_updates_background():
+    """Called once from nova.py's startup maintenance thread. Populates
+    _update_state so the UI can show a quiet notice without a network
+    call of its own. updater.get_update_info() already throttles itself
+    to once every UPDATE_CHECK_INTERVAL_HOURS unless forced, and fails
+    silently when offline - never let this stop the app opening."""
+    try:
+        info = updater.get_update_info()
+        if info:
+            with _update_lock:
+                _update_state["info"] = info
+    except Exception as e:
+        applog.report_error(e, "background update check")
 
 
 # ---------------------------------------------------------------------
@@ -1311,4 +1346,102 @@ class Api:
         if security.current.is_authenticated:
             db.log_audit("logout", "Signed out")
         security.current.end()
+        return True
+
+    # ------------------------------------------------------------ updates
+    # Phase 3: the user-facing side of app/updater.py. `check_for_updates`
+    # is the manual "Check for updates" button (always bypasses the 24h
+    # throttle); `get_update_status` is what the UI reads on load, which
+    # only reports what the background check already found and never
+    # makes a network call itself.
+
+    @api_method
+    def get_update_status(self):
+        with _update_lock:
+            info = _update_state["info"]
+        return {
+            "info": info,
+            "last_check": db.get_setting(updater.LAST_CHECK_KEY, ""),
+            "version": brand.APP_VERSION,
+        }
+
+    @api_method
+    def check_for_updates(self, force=True):
+        info = updater.get_update_info(force=bool(force))
+        with _update_lock:
+            _update_state["info"] = info
+        return info
+
+    @api_method
+    def start_update_download(self):
+        with _update_lock:
+            info = _update_state["info"]
+            if not info:
+                raise ValidationError("No update is available to download.")
+            if _update_state["downloading"]:
+                return True
+            _update_state["downloading"] = True
+            _update_state["downloaded"] = 0
+            _update_state["total"] = info.get("size", 0)
+            _update_state["error"] = None
+            _update_state["installer_path"] = None
+
+        def _worker():
+            def on_progress(done, total):
+                with _update_lock:
+                    _update_state["downloaded"] = done
+                    if total:
+                        _update_state["total"] = total
+            path = updater.download_installer(info, on_progress=on_progress)
+            with _update_lock:
+                _update_state["downloading"] = False
+                if path:
+                    _update_state["installer_path"] = path
+                else:
+                    _update_state["error"] = (
+                        "The download could not be verified and was discarded. "
+                        "Check the internet connection and try again."
+                    )
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return True
+
+    @api_method
+    def get_update_progress(self):
+        with _update_lock:
+            return {
+                "downloading": _update_state["downloading"],
+                "downloaded": _update_state["downloaded"],
+                "total": _update_state["total"],
+                "ready": _update_state["installer_path"] is not None,
+                "error": _update_state["error"],
+            }
+
+    @api_method
+    def install_update(self):
+        with _update_lock:
+            path = _update_state["installer_path"]
+        if not path:
+            raise ValidationError("The update has not finished downloading yet.")
+        db.log_audit("app.update", f"Installing update: {os.path.basename(path)}")
+        started = updater.apply_update(path)
+        if not started:
+            raise ValidationError("The installer could not be started. Try downloading it again.")
+
+        # Give this call a moment to return its response to the UI before
+        # exiting - the installer is waiting on our AppMutex to close and
+        # then relaunches Vikray on its own (see build/installer.iss).
+        def _quit():
+            time.sleep(1.2)
+            os._exit(0)
+        threading.Thread(target=_quit, daemon=True).start()
+        return True
+
+    @api_method
+    def dismiss_update_notice(self):
+        """'Later' - quiet for this run. The 24h throttle (stored in
+        settings, not here) is what actually controls when the next
+        background check happens, so this never has to touch it."""
+        with _update_lock:
+            _update_state["info"] = None
         return True

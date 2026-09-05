@@ -360,6 +360,15 @@ export const mockApi = {
   create_user: async () => ok(2),
   update_user: async () => ok(true),
   delete_user: async () => ok(true),
+
+  // Auto-update (Phase 3) - mock mode is always "already up to date" so
+  // the browser-preview dev flow never shows an install prompt.
+  get_update_status: async () => ok({ info: null, last_check: new Date().toISOString(), version: '3.0' }),
+  check_for_updates: async () => ok(null),
+  start_update_download: async () => ok(true),
+  get_update_progress: async () => ok({ downloading: false, downloaded: 0, total: 0, ready: false, error: null }),
+  install_update: async () => ok(true),
+  dismiss_update_notice: async () => ok(true),
 };
 
 // The real bridge exposes a couple of methods under two names, because the

@@ -34,7 +34,7 @@ Renaming the product is a one-line change here and nowhere else.
 APP_NAME = "Vikray"
 APP_TAGLINE = "Billing & Inventory"
 APP_LEGAL_NAME = "Vikray Retail Software"
-APP_VERSION = "2.0"
+APP_VERSION = "3.0"
 
 # Shown in the About box and the sign-in footer.
 APP_DESCRIPTION = (
@@ -45,6 +45,16 @@ APP_DESCRIPTION = (
 SUPPORT_EMAIL = ""      # fill in before distributing
 SUPPORT_PHONE = ""
 WEBSITE = ""
+
+# ---------------------------------------------------------------------
+# AUTO-UPDATE
+# ---------------------------------------------------------------------
+# The feed is a small JSON file (see app/updater.py). It can live on
+# GitHub Releases, your own website, or a LAN folder - the app just
+# fetches a JSON from a URL and a file from a URL, so changing where it
+# lives later is a one-line change here.
+UPDATE_FEED_URL = "https://github.com/Nikhil-Kedia/Billing/releases/latest/download/latest.json"
+UPDATE_CHECK_INTERVAL_HOURS = 24  # Throttle background checks to once per day
 
 
 def window_title(shop_name=""):

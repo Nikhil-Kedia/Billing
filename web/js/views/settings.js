@@ -12,6 +12,7 @@ import {
   debounce, dmy, hm12, prefs,
   setTheme, getTheme,
 } from '../core.js';
+import { manualCheck, openUpdateModal, setBadge, formatLastChecked } from '../updates.js';
 
 const SECTIONS = [
   { id: 'profile', label: 'Business profile',     icon: 'box' },
@@ -33,6 +34,7 @@ export default {
       ctx, root,
       active: prefs.get('settingsTab', 'profile'),
       settings: {}, users: [], appInfo: null, dataDir: '',
+      updateStatus: null,
       loading: true,
     };
     if (!SECTIONS.some(s => s.id === S.active)) S.active = 'profile';
@@ -90,6 +92,7 @@ async function reload() {
     toast('Could not load settings', e.message, 'bad');
   }
   try { S.dataDir = await api.data_dir(); } catch { S.dataDir = S.dataDir || ''; }
+  try { S.updateStatus = await api.get_update_status(); } catch { S.updateStatus = S.updateStatus || null; }
   S.loading = false;
   renderSection();
 }
@@ -650,6 +653,16 @@ function sectionAbout() {
       </div>
       <div class="divider"></div>
       <div class="set-row">
+        <div class="txt">
+          <div class="t">Updates</div>
+          <div class="d">${aboutUpdateLine()}</div>
+        </div>
+        <button class="btn ${S.updateStatus?.info ? 'btn-primary' : 'btn-ghost'}" id="checkUpdates">
+          ${icon('refresh', 15)}${S.updateStatus?.info ? 'View update' : 'Check for updates'}
+        </button>
+      </div>
+      <div class="divider"></div>
+      <div class="set-row">
         <div class="txt"><div class="t">Data folder</div><div class="d mono ellipsis">${esc(S.dataDir || '—')}</div></div>
         <button class="btn btn-ghost" id="openDataFolder2">${icon('folder', 15)}Open folder</button>
       </div>
@@ -658,6 +671,24 @@ function sectionAbout() {
         <button class="btn btn-ghost" id="resetLayout">${icon('refresh', 15)}Reset layout</button>
       </div>
     </div>`;
+}
+
+function aboutUpdateLine() {
+  const st = S.updateStatus;
+  if (st?.info) return `Version ${esc(st.info.version)} is available.`;
+  const checked = st?.last_check ? formatLastChecked(st.last_check) : '';
+  return checked ? `You are on the latest version · Last checked ${checked}` : 'You are on the latest version.';
+}
+
+async function doCheckUpdates() {
+  if (S.updateStatus?.info) {
+    await openUpdateModal(S.updateStatus.info, S.ctx.app);
+  } else {
+    await manualCheck(S.ctx.app);
+  }
+  try { S.updateStatus = await api.get_update_status(); } catch { /* keep previous */ }
+  setBadge(!!S.updateStatus?.info);
+  renderSection();
 }
 
 function doResetLayout() {
@@ -755,5 +786,6 @@ function wireSection() {
   } else if (S.active === 'about') {
     q('#openDataFolder2', host)?.addEventListener('click', doOpenDataFolder);
     q('#resetLayout', host)?.addEventListener('click', doResetLayout);
+    q('#checkUpdates', host)?.addEventListener('click', doCheckUpdates);
   }
 }

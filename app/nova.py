@@ -63,6 +63,15 @@ def _run_maintenance():
         auto_backup.run_if_due()
     except Exception as e:
         applog.report_error(e, "automatic backup")
+    try:
+        # Phase 2/3 auto-update: a quiet, throttled (24h) check against
+        # the GitHub feed. bridge.py owns the shared state so the
+        # Settings screen and this background check agree on what was
+        # found - see bridge.check_for_updates_background().
+        import bridge
+        bridge.check_for_updates_background()
+    except Exception as e:
+        applog.report_error(e, "update check")
 
 
 def _web_index():
@@ -160,6 +169,17 @@ def main():
                    f"use Settings > Import Data inside the app instead).")
 
     database.init_db()
+
+    # Phase 6a: refuse to run against a database newer than this build
+    # knows about, rather than silently corrupting it. Must run before
+    # anything else touches the database.
+    import updater
+    db_conn = database.get_connection()
+    is_valid, error_msg = updater.check_schema_version(db_conn)
+    db_conn.close()
+    if not is_valid:
+        _fatal("Database version mismatch", error_msg)
+        return
 
     if not _claim_single_instance():
         applog.info("Another copy is already running; this one is closing.")
