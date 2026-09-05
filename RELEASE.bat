@@ -41,7 +41,11 @@ echo   [1/6] Setting version to %VERSION% in brand.py and installer.iss...
 if errorlevel 1 goto :fail
 
 echo   [2/6] Building the installer ^(a minute or two^)...
-call BUILD.bat
+REM BUILD.bat ends with "pause" (fine when someone double-clicks it on
+REM its own) - redirecting its input from NUL makes that pause resolve
+REM immediately instead of hanging RELEASE.bat forever waiting for a
+REM keypress nobody sees coming.
+call BUILD.bat < NUL
 if errorlevel 1 goto :fail
 if not exist "installer\Vikray-Setup-%VERSION%.exe" (
     echo   [X] Expected installer\Vikray-Setup-%VERSION%.exe was not produced.
