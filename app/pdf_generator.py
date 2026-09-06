@@ -263,6 +263,12 @@ def generate_bill_pdf(bill, output_path=None):
     # column" failure Pack hit, on the column funded by taking width
     # away from it. A Paragraph wraps to a second line instead.
     amount_style = ParagraphStyle("AmountStyle", parent=styles["Normal"], fontSize=14.5, fontName="Helvetica-Bold", textColor=BLACK, leading=16, alignment=TA_RIGHT)
+    # The pack total shares the Pack column with per-line pack counts, but
+    # can read "12 Carton + 3 Bundle" - a size or two smaller so a mixed
+    # bill still fits the column instead of wrapping the totals row.
+    pack_total_style = ParagraphStyle("PackTotalStyle", parent=styles["Normal"], fontSize=9.5,
+                                      fontName="Helvetica-Bold", textColor=BLACK, leading=11,
+                                      alignment=TA_RIGHT)
     note_style = ParagraphStyle("NoteStyle", parent=styles["Normal"], fontSize=13, fontName="Helvetica-Oblique", textColor=BLACK, leading=14.5)
     small_center = ParagraphStyle("SmallCenter", parent=styles["Normal"], fontSize=7.5,
                                    fontName="Helvetica", alignment=TA_CENTER, textColor=BLACK)
@@ -385,6 +391,26 @@ def generate_bill_pdf(bill, output_path=None):
 
     n_item_rows = len(bill["items"])
     total_qty = sum(it["quantity"] for it in bill["items"])
+
+    # Total packs, for counting the load against the bill before it goes
+    # out of the door. One bill can mix pack units (cartons, bundles,
+    # bags), and adding those together into a single number would be a
+    # lie, so they are totalled PER UNIT: "12 Carton + 3 Bundle". A line
+    # sold loose (no pack) simply doesn't contribute. Where several units
+    # appear, each is named; where there is only one, it reads as plainly
+    # as the quantity total next to it.
+    pack_totals = {}
+    for it in bill["items"]:
+        pq = it.get("pack_qty")
+        pu = (it.get("pack_unit_name") or "").strip()
+        if pq and pu:
+            pack_totals[pu] = pack_totals.get(pu, 0) + pq
+    # One unit per line rather than a run-on string: the Pack column is
+    # 27mm, so "12 Carton + 3 Bundle" wraps wherever it happens to run
+    # out. A line each is the same height and always breaks in the right
+    # place. Biggest count first - the main load, then the extras.
+    total_packs_display = "<br/>".join(
+        f"{fmt_qty(v)} {esc(k)}" for k, v in sorted(pack_totals.items(), key=lambda kv: -kv[1]))
     row_cursor = 1 + n_item_rows  
 
     freight_row = discount_row = notes_row = None
@@ -471,7 +497,9 @@ def generate_bill_pdf(bill, output_path=None):
         ]
 
     # Temporarily append the Total row just to measure the native table height
-    total_row_data = ["", "Total", "", fmt_qty(total_qty), "",
+    total_row_data = ["", "Total",
+                     Paragraph(total_packs_display, pack_total_style) if total_packs_display else "",
+                     fmt_qty(total_qty), "",
                      Paragraph(f"Rs. {format_indian_currency(bill['total'])}", amount_style)]
     table_data.append(total_row_data)
 

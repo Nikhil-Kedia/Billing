@@ -139,6 +139,9 @@ function paint(root) {
 
           <div>
             <div class="sum-line"><span class="k">Subtotal</span><span class="v" id="s-sub">Rs. 0.00</span></div>
+            <div class="sum-line" id="s-packs-line" hidden>
+              <span class="k">Total packs</span><span class="v mono" id="s-packs">—</span>
+            </div>
             <div class="sum-line">
               <span class="k">Addition</span>
               <input class="input input-sm mono" id="f-add" style="width:112px;text-align:right" placeholder="0.00">
@@ -519,6 +522,7 @@ function recalc() {
   const total = +(sub + add - less).toFixed(2);
 
   q('#s-sub', S.root).textContent = inr(sub);
+  paintPackTotal();
   q('#s-total', S.root).textContent = inr(total);
 
   // "pay in full" stays the default until the user types their own figure
@@ -531,6 +535,30 @@ function recalc() {
   S.lastAutoTotal = total;
   renumber();
   return { sub, add, less, total };
+}
+
+/** How many packs are going out with this bill, so the load can be
+    counted against the paper before it leaves. Units are kept apart -
+    "12 Carton + 3 Bundle" - because adding cartons to bundles would
+    produce a number that is true of nothing. Matches the total printed
+    on the PDF (see pdf_generator.py). */
+function paintPackTotal() {
+  const line = q('#s-packs-line', S.root);
+  if (!line) return;
+  const totals = new Map();
+  for (const r of S.rows) {
+    if (!validRow(r)) continue;
+    const unit = (r.packUnit || '').trim();
+    const packs = num(r.pack.value, 0);
+    if (!unit || !packs) continue;          // sold loose - nothing to count
+    totals.set(unit, (totals.get(unit) || 0) + packs);
+  }
+  if (!totals.size) { line.hidden = true; return; }
+  line.hidden = false;
+  q('#s-packs', S.root).textContent = [...totals.entries()]
+    .sort((a, b) => b[1] - a[1])
+    .map(([unit, n]) => `${fmtQty(n)} ${unit}`)
+    .join(' + ');
 }
 
 /* ============================ the keyboard grid ============================ */

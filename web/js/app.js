@@ -97,6 +97,21 @@ async function boot() {
   // background thread throttled to once every 24h). The delay just lets
   // the splash screen clear first.
   setTimeout(() => notifyIfPending(app), 2500);
+
+  // "Require sign-in" is on, but there is no owner account this computer
+  // can use, so the app has deliberately opened UNLOCKED rather than
+  // shutting the shop out of its own books (see database.is_auth_enabled).
+  // That is not a state to leave unsaid.
+  if (info?.auth_needs_owner) {
+    setTimeout(async () => {
+      const yes = await confirm('Sign-in is switched on, but there is no owner account',
+        'This computer has no owner account for this shop\'s data, so the app has opened '
+        + 'unlocked rather than locking you out of it.\n\nSet up an owner account now to turn '
+        + 'sign-in back on properly.',
+        { ok: 'Set up owner account' });
+      if (yes && await claimDeviceDialog()) location.reload();
+    }, 1200);
+  }
 }
 
 /** Fills #app with a full-screen sign-in form and resolves once
@@ -134,6 +149,17 @@ function signInGate(info) {
             </div>
             <div class="small" style="color:var(--bad)" id="si-err" hidden></div>
             <button class="btn btn-primary" type="submit" style="justify-content:center">Sign in</button>
+            ${info?.can_claim_device ? `
+              <div class="divider" style="margin:4px 0"></div>
+              <div class="tiny muted">
+                This computer has not been set up for this shop's data yet — the accounts in it
+                were made on another machine.
+              </div>
+              <button class="btn" type="button" id="si-claim" style="justify-content:center">
+                ${icon('shield', 15)}Set up this computer
+              </button>` : ''}
+            <button class="btn btn-ghost btn-sm" type="button" id="si-recover"
+              style="justify-content:center">Forgot the password? Use a recovery code</button>
           </form>
         </div>
       </div>`;
@@ -141,6 +167,7 @@ function signInGate(info) {
     const form = q('#signinForm');
     const err = q('#si-err');
     const btn = form.querySelector('button[type=submit]');
+    const fail = (msg) => { err.textContent = msg; err.hidden = false; };
 
     form.addEventListener('submit', async (e) => {
       e.preventDefault();
@@ -150,13 +177,145 @@ function signInGate(info) {
         await api.sign_in(q('#si-user').value.trim(), q('#si-pass').value);
         resolve();
       } catch (ex) {
-        err.textContent = ex.message || 'That username or password is not right.';
-        err.hidden = false;
+        fail(ex.message || 'That username or password is not right.');
         btn.disabled = false;
         q('#si-pass').value = '';
         q('#si-pass').focus();
       }
     });
+
+    q('#si-claim')?.addEventListener('click', async () => {
+      if (await claimDeviceDialog()) resolve();
+    });
+    q('#si-recover')?.addEventListener('click', async () => {
+      if (await recoveryDialog(q('#si-user').value.trim())) {
+        fail('Password changed. Sign in with the new one.');
+        q('#si-pass').focus();
+      }
+    });
+  });
+}
+
+/** Creates the owner account on a machine this data has been carried to.
+ *  The backend decides whether this is allowed (bridge.claim_device →
+ *  db.can_claim_device); this dialog only asks for the details. */
+async function claimDeviceDialog() {
+  const body = node(`<div class="col gap4">
+    <div class="small">
+      Sign-in is switched on for this shop's data, but the accounts inside it were created on a
+      different computer, so none of them can be used here. Set up an owner account for
+      <b>this</b> computer to get back in.
+    </div>
+    <div class="small muted">
+      Nothing is deleted: the accounts made on the other computer keep working there.
+    </div>
+    <div class="row gap3">
+      <div class="field grow">
+        <label class="label">Username<span class="req">*</span></label>
+        <input class="input" id="cd-user" autocomplete="off" placeholder="owner">
+      </div>
+      <div class="field grow">
+        <label class="label">Your name</label>
+        <input class="input" id="cd-name" autocomplete="off" placeholder="Optional">
+      </div>
+    </div>
+    <div class="row gap3">
+      <div class="field grow">
+        <label class="label">Password<span class="req">*</span></label>
+        <input class="input" id="cd-pass" type="password" autocomplete="new-password">
+      </div>
+      <div class="field grow">
+        <label class="label">Confirm password<span class="req">*</span></label>
+        <input class="input" id="cd-pass2" type="password" autocomplete="new-password">
+      </div>
+    </div>
+    <div class="tiny muted">At least 8 characters.</div>
+  </div>`);
+
+  let created = null;
+  const ok = await modal({
+    title: 'Set up this computer', icon: 'shield', body,
+    actions: [
+      { label: 'Cancel', value: false },
+      {
+        label: 'Create owner account', cls: 'btn-primary', default: true,
+        onClick: async () => {
+          try {
+            created = await api.claim_device({
+              username: q('#cd-user', body).value.trim(),
+              display_name: q('#cd-name', body).value.trim(),
+              password: q('#cd-pass', body).value,
+              confirm: q('#cd-pass2', body).value,
+            });
+          } catch (e) {
+            toast('Could not set up this computer', e.message, 'bad', 7000);
+            return false;
+          }
+          return true;
+        },
+      },
+    ],
+  });
+  if (!ok || !created) return false;
+
+  // Shown exactly once. The whole reason this dialog exists is somebody
+  // being locked out, so the account it just made comes with its own way
+  // back in - and this is the only moment the code is ever visible.
+  await modal({
+    title: 'Write this down', icon: 'shield',
+    body: node(`<div class="col gap4">
+      <div class="small">Your recovery code. It is the way back in if this password is ever
+        forgotten, and it is shown <b>only now</b> — it is not stored anywhere you can read it later.</div>
+      <div class="mono" style="font-size:22px;font-weight:700;letter-spacing:.06em;text-align:center;
+        padding:16px;background:var(--surface-2);border-radius:var(--r-md);user-select:all">
+        ${esc(created.recovery_code)}</div>
+      <div class="tiny muted">Keep it somewhere that is not this computer.</div>
+    </div>`),
+    actions: [{ label: 'I have written it down', cls: 'btn-primary', default: true, value: true }],
+  });
+  return true;
+}
+
+/** The one-time recovery code path. The data layer has had this since
+ *  sign-in was first built; until now no screen offered it. */
+async function recoveryDialog(prefillUser) {
+  const body = node(`<div class="col gap4">
+    <div class="small">Enter the recovery code that was shown when the account was created,
+      and choose a new password.</div>
+    <div class="field">
+      <label class="label">Username<span class="req">*</span></label>
+      <input class="input" id="rc-user" autocomplete="username" value="${esc(prefillUser || '')}">
+    </div>
+    <div class="field">
+      <label class="label">Recovery code<span class="req">*</span></label>
+      <input class="input mono" id="rc-code" autocomplete="off" placeholder="XXXX-XXXX-XXXX-XXXX">
+    </div>
+    <div class="field">
+      <label class="label">New password<span class="req">*</span></label>
+      <input class="input" id="rc-pass" type="password" autocomplete="new-password">
+    </div>
+  </div>`);
+
+  return !!await modal({
+    title: 'Use a recovery code', icon: 'shield', body,
+    actions: [
+      { label: 'Cancel', value: false },
+      {
+        label: 'Set new password', cls: 'btn-primary', default: true,
+        onClick: async () => {
+          try {
+            await api.reset_with_recovery_code(
+              q('#rc-user', body).value.trim(),
+              q('#rc-code', body).value.trim(),
+              q('#rc-pass', body).value);
+          } catch (e) {
+            toast('Could not use that code', e.message, 'bad', 7000);
+            return false;
+          }
+          return true;
+        },
+      },
+    ],
   });
 }
 
@@ -209,6 +368,14 @@ function render() {
         <button class="btn btn-ghost btn-icon btn-sm" id="railToggle" title="Collapse sidebar (Ctrl+B)">
           ${icon('grip', 16)}
         </button>
+        <div class="row gap1 histnav">
+          <button class="btn btn-ghost btn-icon btn-sm" id="navBack" title="Back (Alt+Left)" disabled>
+            ${icon('arrowLeft', 17)}
+          </button>
+          <button class="btn btn-ghost btn-icon btn-sm" id="navFwd" title="Forward (Alt+Right)" disabled>
+            ${icon('arrowRight', 17)}
+          </button>
+        </div>
         <div class="grow" style="min-width:0">
           <h1 id="viewTitle" class="ellipsis">…</h1>
           <div class="sub ellipsis" id="viewSub"></div>
@@ -221,6 +388,9 @@ function render() {
   paintNav();
 
   q('#railToggle').onclick = toggleRail;
+  q('#navBack').onclick = goBack;
+  q('#navFwd').onclick = goForward;
+  paintHistoryButtons();
   q('#cmdk').onclick = palette;
   q('#who').onclick = (e) => userMenu(e.currentTarget);
   on(q('#app'), 'click', '[data-nav]', (e, b) => go(b.dataset.nav));
@@ -254,8 +424,55 @@ function toggleRail() {
 }
 
 /* ---------- routing ---------- */
-async function go(id, params = null) {
+/* Where you have been, so Back and Forward mean what they mean in a
+   browser. The shop's work is full of one-way hops - a customer's row
+   sends you to Insights, a low-stock tile sends you to Inventory, the
+   command palette sends you anywhere - and until now the only way back
+   was to remember which sidebar item you had come from.
+
+   Entries hold the params too, so going back to Customer Insights
+   returns to the customer you were looking at, not a blank screen.
+   Bounded, because a till left open all day would otherwise grow this
+   for ever. */
+const HISTORY_MAX = 60;
+const hist = { stack: [], at: -1 };
+
+function paintHistoryButtons() {
+  const back = q('#navBack'), fwd = q('#navFwd');
+  if (!back || !fwd) return;
+  back.disabled = hist.at <= 0;
+  fwd.disabled = hist.at >= hist.stack.length - 1;
+}
+
+function pushHistory(id, params) {
+  const cur = hist.stack[hist.at];
+  // Re-opening the screen you are already on (clicking its sidebar item
+  // again, or refresh()) is not a journey - don't make Back undo it.
+  if (cur && cur.id === id && JSON.stringify(cur.params ?? null) === JSON.stringify(params ?? null)) return;
+  hist.stack = hist.stack.slice(0, hist.at + 1);
+  hist.stack.push({ id, params });
+  if (hist.stack.length > HISTORY_MAX) hist.stack.shift();
+  hist.at = hist.stack.length - 1;
+}
+
+function goBack() {
+  if (hist.at <= 0) return;
+  hist.at -= 1;
+  const e = hist.stack[hist.at];
+  go(e.id, e.params, { history: false });
+}
+
+function goForward() {
+  if (hist.at >= hist.stack.length - 1) return;
+  hist.at += 1;
+  const e = hist.stack[hist.at];
+  go(e.id, e.params, { history: false });
+}
+
+async function go(id, params = null, opts = {}) {
   if (!VIEWS[id]) id = 'dashboard';
+  if (opts.history !== false) pushHistory(id, params);
+  paintHistoryButtons();
   const stage = q('#stage');
 
   // leave the old view
@@ -329,7 +546,7 @@ function paintActions(list = []) {
   });
 }
 
-function refresh() { return go(app.viewId, app.params); }
+function refresh() { return go(app.viewId, app.params, { history: false }); }
 
 function setBusy(on) {
   document.body.style.cursor = on ? 'progress' : '';
@@ -427,6 +644,7 @@ function shortcutsHelp() {
       ['Ctrl + N', 'Start a new bill'],
       ['Ctrl + B', 'Collapse or expand the sidebar'],
       ['Ctrl + 1…9', 'Jump to the nth screen'],
+      ['Alt + ← / →', 'Back and forward through the screens you have visited'],
       ['F1', 'This list'],
       ['Esc', 'Close a dialog or dropdown'],
     ]],
@@ -460,6 +678,12 @@ function shortcutsHelp() {
 document.addEventListener('keydown', (e) => {
   const typing = e.target.matches('input,textarea,select,[contenteditable]');
   if (e.key === 'F1') { e.preventDefault(); shortcutsHelp(); return; }
+  // Alt+Left / Alt+Right, same as every browser. Safe while typing:
+  // neither combination means anything inside a text box.
+  if (e.altKey && !e.ctrlKey && !e.shiftKey) {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); goBack(); return; }
+    if (e.key === 'ArrowRight') { e.preventDefault(); goForward(); return; }
+  }
   if (e.ctrlKey && !e.shiftKey && !e.altKey) {
     const k = e.key.toLowerCase();
     if (k === 'k') { e.preventDefault(); palette(); return; }

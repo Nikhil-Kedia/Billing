@@ -326,6 +326,19 @@ class Api:
             "data_dir": appdata.data_dir(),
             "needs_auth": db.is_auth_enabled() and not security.current.is_authenticated,
             "can": self._permissions(),
+            # True when this copy of the data has landed on a machine it
+            # has never been used on - see security.device_fingerprint().
+            # The sign-in screen turns this into a "Set up this device"
+            # option so a pendrive copy is not a locked box.
+            "can_claim_device": db.can_claim_device(),
+            "owner_exists": db.count_owners() > 0,
+            # Sign-in is switched ON but there is no owner account to
+            # satisfy it. is_auth_enabled() treats that as "not really set
+            # up" so the shop is not locked out of its own data - but it
+            # must be said out loud rather than silently leaving the app
+            # open, so the UI prompts for an owner account.
+            "auth_needs_owner": (db.get_setting("auth_enabled", "0") == "1"
+                                 and db.count_owners() == 0),
         }
 
     @staticmethod
@@ -810,6 +823,22 @@ class Api:
             shift_val = validation.quantity(shifts, "Shifts", allow_zero=True)
         db.mark_attendance(employee_id, date_str, status, shift_val)
         return True
+
+    @api_method
+    def mark_attendance_session(self, employee_id, date_str, session, status):
+        """Marks one half of one day - 'am' or 'pm'. This is what the
+        grid uses; mark_attendance() above still sets a whole day at
+        once."""
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        date_str = validation.bill_date(date_str)
+        if session not in ("am", "pm"):
+            raise ValidationError("Attendance can only be marked for the morning or the evening.")
+        if status not in ("present", "absent", "leave", "clear"):
+            raise ValidationError("Unknown attendance status.")
+        try:
+            return db.mark_attendance_session(employee_id, date_str, session, status)
+        except ValueError as e:
+            raise ValidationError(str(e))
 
     @api_method
     def add_advance(self, employee_id, date_str, amount, notes=""):
@@ -1312,6 +1341,22 @@ class Api:
         return True
 
     @api_method
+    def merge_customers(self, source_id, target_id):
+        """Folds one duplicate customer into another. Deliberately gated
+        where plain delete_customer is not: a merge rewrites the customer
+        name stored on real bills, which is a heavier thing than removing
+        a record nobody has billed yet."""
+        security.require(security.PERM_DELETE_CUSTOMER)
+        try:
+            summary = db.merge_customers(int(source_id), int(target_id))
+        except ValueError as e:
+            raise ValidationError(str(e))
+        db.log_audit("customer.merge",
+                      f"Merged '{summary['merged_name']}' into '{summary['kept_name']}' "
+                      f"({summary['bills_moved']} bill(s), {summary['ledger_moved']} khata entr(ies) moved)")
+        return summary
+
+    @api_method
     def customers_with_dues(self):
         return db.get_customers_with_dues(limit=1_000_000)
 
@@ -1553,7 +1598,96 @@ class Api:
             "authenticated": security.current.is_authenticated,
             "user": _public_user(db.get_user(security.current.user_id))
                     if security.current.is_authenticated else None,
+            "can_claim_device": db.can_claim_device(),
+            "owner_exists": db.count_owners() > 0,
         }
+
+    @api_method
+    def claim_device(self, data):
+        """Creates an owner account on a machine this database has not
+        been used on before, and signs in as it.
+
+        This is the way out of a lockout that has nothing to do with
+        forgetting a password: the shop's data file was carried to
+        another computer - a new machine, a repaired one, a pendrive copy
+        - where the accounts that exist were made somewhere else and
+        cannot be reached. Without this the owner is shut out of their own
+        books by a feature meant to protect them.
+
+        db.can_claim_device() is what decides, and it is checked HERE, not
+        just hidden in the UI - on the machine this database belongs to,
+        with an owner account present, this raises. So the counter staff
+        cannot reach it, which is the only escalation that would matter.
+
+        Existing accounts are left alone: the old owner login still works
+        if whoever has it turns up.
+        """
+        if not db.can_claim_device():
+            raise ValidationError(
+                "This computer is already set up for this shop's data.\n\n"
+                "Sign in with an existing account, or ask the owner to add one for you "
+                "from Settings > Users.")
+
+        data = data or {}
+        username = validation.clean_text(data.get("username"), 40, "Username", allow_empty=False)
+        if not all(ch.isalnum() or ch in "._-" for ch in username):
+            raise ValidationError("Username can only contain letters, numbers, and . _ -")
+        password = data.get("password") or ""
+        good, msg = security.validate_password_strength(password, security.ROLE_OWNER)
+        if not good:
+            raise ValidationError(msg)
+        if password != (data.get("confirm") or password):
+            raise ValidationError("The two passwords do not match.")
+        display_name = validation.clean_text(data.get("display_name"), 120, "Display name")
+
+        # A recovery code is generated here and shown once. The whole
+        # reason this method exists is somebody being locked out, so the
+        # account it creates ships with its own way back in.
+        recovery_code = security.generate_recovery_code()
+        try:
+            user_id = db.create_user(username, password, security.ROLE_OWNER,
+                                      display_name=display_name, recovery_code=recovery_code)
+        except ValueError as e:
+            raise ValidationError(str(e))
+
+        db.bind_auth_device()
+        db.log_audit("device.claim",
+                      f"Owner account '{username}' created to set up this computer",
+                      as_username=username, as_role=security.ROLE_OWNER)
+
+        user = db.get_user(user_id)
+        security.current.enabled = db.is_auth_enabled()
+        security.current.start(user["id"], user["username"], user["role"],
+                               user.get("display_name") or user["username"])
+        return {"user": _public_user(user), "recovery_code": recovery_code}
+
+    @api_method
+    def reset_with_recovery_code(self, username, code, new_password):
+        """The other way back in: the one-time code shown when an owner
+        account was created. Already implemented in the data layer since
+        the first version of sign-in, but never reachable from any screen
+        - so in practice nobody could use it. The sign-in form offers it
+        now."""
+        username = (username or "").strip()
+        if not username or not (code or "").strip():
+            raise ValidationError("Enter your username and the recovery code.")
+        user = db.get_user_by_username(username)
+        role = (user or {}).get("role") or security.ROLE_STAFF
+        good, msg = security.validate_password_strength(new_password or "", role)
+        if not good:
+            raise ValidationError(msg)
+        # Consumes the code on success, so a written-down one cannot be
+        # used twice by whoever finds the paper.
+        recovered = db.verify_recovery_code(username, code)
+        if not recovered:
+            raise ValidationError(
+                "That username and recovery code do not match.\n\n"
+                "The code is the one shown once when the account was created. "
+                "If it has been used already, it no longer works.")
+        db.set_user_password(recovered["id"], new_password)
+        db.log_audit("recovery.reset", "Password reset with a recovery code",
+                      as_username=username)
+        return True
 
     @api_method
     def sign_out(self):

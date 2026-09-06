@@ -145,6 +145,24 @@ _EMPLOYEE_LIMITS = {
 # corrupt file could land a nonsense string in a column the calendar
 # grid / payroll screen switches on by exact value.
 _VALID_ATTENDANCE_STATUS = {"present", "half", "absent", "leave"}
+
+
+def _row_halves(row):
+    """(am_status, pm_status) for an imported attendance row.
+
+    A backup written before attendance had two halves carries only the
+    day status, so it is split the same way database.py's own migration
+    splits it - a recorded "half day" meaning the morning was worked.
+    """
+    am, pm = row.get("am_status"), row.get("pm_status")
+    if am or pm:
+        return am, pm
+    day = row.get("status")
+    if day == "half":
+        return "present", "absent"
+    if day in ("present", "absent", "leave"):
+        return day, day
+    return None, None
 _VALID_PAY_TYPE = {"monthly", "daily", "shift"}
 _VALID_PAYROLL_STATUS = {"pending", "paid"}
 
@@ -260,7 +278,8 @@ _TABLE_SCHEMA_SQL = {
             created_at TEXT, updated_at TEXT)""",
     "attendance": """CREATE TABLE attendance (
             id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER NOT NULL, date TEXT NOT NULL,
-            status TEXT NOT NULL, shifts REAL DEFAULT 1, notes TEXT DEFAULT '', marked_at TEXT,
+            status TEXT NOT NULL, am_status TEXT, pm_status TEXT,
+            shifts REAL DEFAULT 1, notes TEXT DEFAULT '', marked_at TEXT,
             UNIQUE(employee_id, date))""",
     "employee_advances": """CREATE TABLE employee_advances (
             id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER NOT NULL, date TEXT NOT NULL,
@@ -1252,15 +1271,16 @@ def _apply_import_inner(conn, plan):
                 summary["attendance"]["skipped"] += 1
                 continue
             if conflict is not None and conflict.resolution == "overwrite":
-                cur.execute("UPDATE attendance SET status=?, shifts=?, notes=?, marked_at=? WHERE id=?",
-                            (row["status"], row.get("shifts") or 1, row.get("notes") or "",
-                             row.get("marked_at"), conflict.existing_id))
+                cur.execute("UPDATE attendance SET status=?, am_status=?, pm_status=?, shifts=?, "
+                            "notes=?, marked_at=? WHERE id=?",
+                            (row["status"], *_row_halves(row), row.get("shifts") or 1,
+                             row.get("notes") or "", row.get("marked_at"), conflict.existing_id))
                 summary["attendance"]["updated"] += 1
             else:
-                cur.execute("""INSERT OR IGNORE INTO attendance (employee_id, date, status, shifts, notes,
-                                marked_at) VALUES (?,?,?,?,?,?)""",
-                            (new_emp_id, row["date"], row["status"], row.get("shifts") or 1,
-                             row.get("notes") or "", row.get("marked_at")))
+                cur.execute("""INSERT OR IGNORE INTO attendance (employee_id, date, status, am_status,
+                                pm_status, shifts, notes, marked_at) VALUES (?,?,?,?,?,?,?,?)""",
+                            (new_emp_id, row["date"], row["status"], *_row_halves(row),
+                             row.get("shifts") or 1, row.get("notes") or "", row.get("marked_at")))
                 summary["attendance"]["added"] += 1
             continue
 

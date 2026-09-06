@@ -10,7 +10,7 @@
 ; ============================================================
 
 #define AppName        "Vikray"
-#define AppVersion     "3.0.3"
+#define AppVersion     "3.0.4"
 #define AppPublisher   "Vikray Retail Software"
 #define AppExeName     "Vikray.exe"
 #define SrcDir         "..\dist\Vikray"

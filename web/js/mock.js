@@ -345,6 +345,10 @@ export const mockApi = {
       };
     })),
   add_customer: async () => ok(1), update_customer: async () => ok(true), delete_customer: async () => ok(true),
+  merge_customers: async () => ok({ merged_name: 'DUPLICATE', kept_name: 'KEPT', bills_moved: 3, ledger_moved: 2 }),
+  claim_device: async () => ok({ user: { id: 1, username: 'owner', role: 'owner' },
+                                 recovery_code: 'K7QP-2MRX-9FTA-4WHD' }),
+  reset_with_recovery_code: async () => ok(true),
   customers_with_dues: async () => ok(customers.map(c => ({ ...c, balance: balanceOf(c.id) }))
     .filter(c => c.balance > 0).sort((a, b) => b.balance - a.balance)),
   customer_ledger: async (id) => ok(ledger[id] || []),
@@ -405,13 +409,27 @@ export const mockApi = {
   update_employee: async (id, data) => { const e = mockEmployees.find(x => x.id === id); if (e) Object.assign(e, data); return ok(true); },
   set_employee_active: async (id, active) => { const e = mockEmployees.find(x => x.id === id); if (e) e.active = active ? 1 : 0; return ok(true); },
   attendance_month: async (month) => ok(mockAttendance[month] || {}),
-  mark_attendance: async (employeeId, date, status, shifts) => {
+  mark_attendance: async (employeeId, date, status) => {
     const m = date.slice(0, 7);
     mockAttendance[m] = mockAttendance[m] || {};
     mockAttendance[m][employeeId] = mockAttendance[m][employeeId] || {};
-    if (status === 'clear') delete mockAttendance[m][employeeId][date];
-    else mockAttendance[m][employeeId][date] = { status, shifts: shifts ?? 1 };
+    if (status === 'clear') { delete mockAttendance[m][employeeId][date]; return ok(true); }
+    const am = status === 'half' ? 'present' : status;
+    const pm = status === 'half' ? 'absent' : status;
+    mockAttendance[m][employeeId][date] = { status, am, pm, shifts: (am === 'present') + (pm === 'present') };
     return ok(true);
+  },
+  mark_attendance_session: async (employeeId, date, session, status) => {
+    const m = date.slice(0, 7);
+    mockAttendance[m] = mockAttendance[m] || {};
+    const rec = (mockAttendance[m][employeeId] = mockAttendance[m][employeeId] || {});
+    const day = rec[date] || { am: null, pm: null };
+    day[session] = status === 'clear' ? null : status;
+    if (!day.am && !day.pm) { delete rec[date]; return ok({ am: null, pm: null, status: null }); }
+    day.status = day.am === day.pm ? day.am : 'half';
+    day.shifts = (day.am === 'present') + (day.pm === 'present');
+    rec[date] = day;
+    return ok(day);
   },
   add_advance: async (employeeId, date, amount, notes) => {
     const id = ++mockAdvSeq;
@@ -426,8 +444,8 @@ export const mockApi = {
     return ok(emp ? {
       employee_id: employeeId, employee_name: emp.name, period_month: month,
       pay_type: emp.pay_type, pay_rate: emp.pay_rate, days_in_month: 30,
-      present_days: 0, half_days: 0, absent_days: 0, leave_days: 0, shifts_total: 0,
-      gross_pay: 0, advances_deducted: 0, advance_ids: [], net_pay: 0,
+      present_days: 12.5, half_days: 1, absent_days: 1, leave_days: 2, shifts_total: 25,
+      gross_pay: emp.pay_rate || 0, advances_deducted: 0, advance_ids: [], net_pay: emp.pay_rate || 0,
     } : null);
   },
   finalize_payroll: async () => ok(++mockPayrollSeq),

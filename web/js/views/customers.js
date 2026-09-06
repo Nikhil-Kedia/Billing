@@ -14,7 +14,7 @@ import { api } from '../api.js';
 import * as Panels from '../panels.js';
 import { openCustomerModal as openSharedCustomerModal } from '../customer-edit.js';
 import {
-  q, qa, on, node, esc, icon, inr, dmy, initials, toast, confirm,
+  q, qa, on, node, esc, icon, inr, dmy, initials, toast, modal, confirm,
   emptyState, debounce,
 } from '../core.js';
 
@@ -135,7 +135,7 @@ function renderThead() {
     <div class="grow">Address</div>
     <div class="num-cell" style="width:150px"><span class="sortable" data-sort="balance">Balance${arrow('balance')}</span></div>
     <div style="width:132px"><span class="sortable" data-sort="last">Last purchase${arrow('last')}</span></div>
-    <div style="width:96px"></div>`;
+    <div style="width:126px"></div>`;
 }
 
 function rowHtml(c) {
@@ -149,9 +149,10 @@ function rowHtml(c) {
     <div class="ellipsis grow">${esc(c.address || '—')}</div>
     <div class="num-cell mono" style="width:150px;${bal > 0.009 ? 'color:var(--bad-ink)' : ''}">${inr(bal)}</div>
     <div class="ellipsis" style="width:132px">${c.last_purchase ? dmy(c.last_purchase) : '—'}</div>
-    <div class="acts" style="width:96px">
+    <div class="acts" style="width:126px">
       <button class="btn btn-ghost btn-icon btn-sm" data-act="insights" title="View insights">${icon('chart', 14)}</button>
       <button class="btn btn-ghost btn-icon btn-sm" data-act="edit" title="Edit customer">${icon('pencil', 14)}</button>
+      <button class="btn btn-ghost btn-icon btn-sm" data-act="merge" title="Merge with another customer">${icon('users', 14)}</button>
       <button class="btn btn-ghost btn-icon btn-sm" data-act="delete" title="Delete customer">${icon('trash', 14)}</button>
     </div>
   </div>`;
@@ -240,6 +241,7 @@ function renderDetail() {
         <button class="btn grow" id="editCust">${icon('pencil', 14)}Edit details</button>
         <button class="btn btn-primary grow" id="fullInsights">${icon('chart', 14)}Full insights</button>
       </div>
+      <button class="btn btn-ghost" id="mergeCust" style="width:100%">${icon('users', 14)}Merge with another customer…</button>
     </div>`;
 
   q('#fullInsights', S.root).onclick = () => S.ctx.go('insights', { customerId: c.id });
@@ -247,6 +249,7 @@ function renderDetail() {
   // appears on hover, which is why "there is no way to edit a customer"
   // was a fair reading of this screen.
   q('#editCust', S.root).onclick = () => openCustomerModal(c);
+  q('#mergeCust', S.root).onclick = () => openMergeModal(c);
   loadRecentBills(c.id);
 }
 
@@ -293,6 +296,7 @@ function wire() {
       const act = actBtn.dataset.act;
       if (act === 'insights') S.ctx.go('insights', { customerId: id });
       else if (act === 'edit') openCustomerModal(c);
+      else if (act === 'merge') openMergeModal(c);
       else if (act === 'delete') deleteCustomer(c);
       return;
     }
@@ -311,6 +315,107 @@ function wire() {
    Insights can open the same one - see that file for why. */
 function openCustomerModal(cust) {
   return openSharedCustomerModal(cust, { onSaved: reload });
+}
+
+/* ============================ merge ============================ */
+/* Two records for one person - "RAJESH KUMAR" and "RAJESH KUMER", or the
+   same shop entered once under the owner's name and once under the
+   shop's - used to be unfixable: deleting either took its bills and
+   khata with it. This folds one into the other instead, and is
+   deliberately explicit about which name survives, because that name is
+   what gets written onto the bills that move. */
+async function openMergeModal(cust) {
+  const others = S.customers.filter(c => c.id !== cust.id);
+  if (!others.length) {
+    toast('Nothing to merge with', 'There is only one customer on file.', 'info');
+    return;
+  }
+
+  const body = node(`<div class="col gap4">
+    <div class="row gap3" style="padding:10px 12px;background:var(--surface-2);border-radius:var(--r-md)">
+      <div class="avatar">${esc(initials(cust.name))}</div>
+      <div class="col" style="gap:1px;min-width:0">
+        <div class="strong ellipsis">${esc(cust.name)}</div>
+        <div class="tiny muted">${esc([cust.phone, cust.address].filter(Boolean).join(' · ') || 'No contact details')}
+          · ${cust.bill_count || 0} bill${(cust.bill_count || 0) === 1 ? '' : 's'}</div>
+      </div>
+    </div>
+    <div class="field">
+      <label class="label">Merge this customer into<span class="req">*</span></label>
+      <div class="search"><input class="input" id="mg-q" placeholder="Search the customer to keep…" autocomplete="off"></div>
+      <div class="tiny muted" style="margin-top:6px">The customer you pick here is the one that stays.</div>
+    </div>
+    <div class="col gap1" id="mg-list" style="max-height:210px;overflow-y:auto"></div>
+    <div class="tiny" id="mg-effect" style="color:var(--warn-ink);min-height:34px"></div>
+  </div>`);
+
+  let picked = null;
+
+  const paintList = () => {
+    const t = (q('#mg-q', body).value || '').trim().toLowerCase();
+    const hits = (!t ? others : others.filter(c =>
+      String(c.name).toLowerCase().includes(t) ||
+      String(c.phone || '').includes(t) ||
+      String(c.address || '').toLowerCase().includes(t))).slice(0, 40);
+    q('#mg-list', body).innerHTML = hits.length ? hits.map(c => `
+      <button class="row gap3 tap mg-row${picked?.id === c.id ? ' on' : ''}" data-cid="${c.id}"
+        style="width:100%;text-align:left;padding:8px 10px;border-radius:var(--r-md);
+               border:1px solid ${picked?.id === c.id ? 'var(--accent)' : 'var(--line)'};
+               background:${picked?.id === c.id ? 'var(--accent-soft)' : 'transparent'}">
+        <div class="avatar">${esc(initials(c.name))}</div>
+        <div class="col grow" style="gap:1px;min-width:0">
+          <span class="small strong ellipsis">${esc(c.name)}</span>
+          <span class="tiny muted ellipsis">${esc([c.phone, c.address].filter(Boolean).join(' · ') || 'No contact details')}</span>
+        </div>
+        <span class="tiny muted">${c.bill_count || 0} bill${(c.bill_count || 0) === 1 ? '' : 's'}</span>
+      </button>`).join('')
+      : `<div class="small muted" style="padding:8px">No customer matches that.</div>`;
+  };
+
+  const paintEffect = () => {
+    const host = q('#mg-effect', body);
+    if (!picked) { host.textContent = ''; return; }
+    const bills = cust.bill_count || 0;
+    host.innerHTML = `${esc(cust.name)}'s ${bills} bill${bills === 1 ? '' : 's'} and khata entries move to
+      <b>${esc(picked.name)}</b>, and the two balances become one.
+      Those bills will then read <b>${esc(picked.name)}</b>.
+      "${esc(cust.name)}" is removed. This cannot be undone.`;
+  };
+
+  on(body, 'input', '#mg-q', paintList);
+  on(body, 'click', '.mg-row', (e, b) => {
+    picked = S.byId.get(+b.dataset.cid) || null;
+    paintList(); paintEffect();
+  });
+  paintList();
+
+  const res = await modal({
+    title: 'Merge customers', icon: 'users', body,
+    actions: [
+      { label: 'Cancel', value: false },
+      {
+        label: 'Merge', cls: 'btn-danger', default: true,
+        onClick: async () => {
+          if (!picked) { toast('Pick a customer', 'Choose which customer to keep.', 'bad'); return false; }
+          try {
+            const out = await api.merge_customers(cust.id, picked.id);
+            toast('Customers merged',
+                  `${out.bills_moved} bill(s) and ${out.ledger_moved} khata entr(ies) now belong to ${picked.name}.`,
+                  'ok', 6000);
+          } catch (e) {
+            toast('Could not merge', e.message, 'bad');
+            return false;
+          }
+          return true;
+        },
+      },
+    ],
+  });
+
+  if (res) {
+    if (S.selectedId === cust.id) S.selectedId = picked?.id || null;
+    await reload();
+  }
 }
 
 /* ============================ delete ============================ */

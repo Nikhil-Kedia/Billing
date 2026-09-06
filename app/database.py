@@ -335,6 +335,28 @@ def init_db():
         )
     """)
 
+    # A working day is two halves. A wholesaler's staff routinely do the
+    # morning and not the evening (or turn up late and stay), and one
+    # status per day could only ever call that "half" without recording
+    # WHICH half - so it could not be checked, argued with, or added up
+    # per shift. am_status/pm_status are the real record; the older
+    # `status` column is kept and maintained as the day's summary
+    # (present / half / absent / leave) so nothing that reads it - a
+    # backup file, an older build opening this database - breaks.
+    for col in ("am_status", "pm_status"):
+        try:
+            cur.execute(f"ALTER TABLE attendance ADD COLUMN {col} TEXT")
+        except sqlite3.OperationalError:
+            pass
+    # Existing single-status days become two matching halves. A recorded
+    # "half day" had no side to it, so it becomes morning worked, evening
+    # not - the common case, and visible/correctable on the grid.
+    cur.execute("""
+        UPDATE attendance SET
+            am_status = CASE WHEN status='half' THEN 'present' ELSE status END,
+            pm_status = CASE WHEN status='half' THEN 'absent'  ELSE status END
+        WHERE am_status IS NULL AND pm_status IS NULL
+    """)
     cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance(employee_id, date)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_advances_emp ON employee_advances(employee_id, settled)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_payroll_emp_month ON payroll_runs(employee_id, period_month)")
@@ -1061,6 +1083,85 @@ def update_customer(customer_id, name, phone, address, notes, sync_bills=True):
     conn.close()
     return bills_updated
 
+def merge_customers(source_id, target_id):
+    """Folds the `source` customer into `target` and deletes the source.
+
+    The same person gets entered twice all the time - a spelling slip, a
+    second phone number, someone typing the shop name one day and the
+    owner's name the next - and until now the only cure was to delete one
+    and lose its bills and khata with it.
+
+    Everything moves; nothing is dropped:
+      - bills change hands, and their stored customer name/phone/address
+        are rewritten to the survivor's, exactly as a rename does (see
+        update_customer) - the point of merging is to end up with ONE
+        name on the history, not two spellings of it.
+      - ledger rows change hands, so the two balances become one balance
+        rather than one of them vanishing.
+      - any field the survivor has left blank is filled in from the
+        source, and the source's notes are kept, appended under its own
+        name so it is obvious where they came from.
+
+    Runs as one transaction: a half-merged customer - bills moved but the
+    record still there, or worse the record gone and its bills orphaned -
+    would be far harder to clean up than the duplicate ever was.
+
+    Returns a summary dict for the confirmation message.
+    """
+    if not source_id or not target_id:
+        raise ValueError("Two different customers are needed for a merge.")
+    if int(source_id) == int(target_id):
+        raise ValueError("That is the same customer twice.")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        src = cur.execute("SELECT * FROM customers WHERE id=?", (source_id,)).fetchone()
+        dst = cur.execute("SELECT * FROM customers WHERE id=?", (target_id,)).fetchone()
+        if src is None or dst is None:
+            raise ValueError("One of those customers no longer exists.")
+        src, dst = dict(src), dict(dst)
+
+        # Fill the survivor's blanks from the record being absorbed.
+        phone = (dst.get("phone") or "").strip() or (src.get("phone") or "").strip()
+        address = (dst.get("address") or "").strip() or (src.get("address") or "").strip()
+        notes = (dst.get("notes") or "").strip()
+        src_notes = (src.get("notes") or "").strip()
+        if src_notes and src_notes not in notes:
+            merged_note = f"[Merged from {src.get('name')}] {src_notes}"
+            notes = (notes + "\n" + merged_note).strip() if notes else merged_note
+
+        cur.execute("UPDATE customers SET phone=?, address=?, notes=? WHERE id=?",
+                    (phone, _upper(address), notes, target_id))
+
+        cur.execute("""UPDATE bills SET customer_id=?, customer_name=?, customer_phone=?,
+                        customer_address=?, updated_at=? WHERE customer_id=?""",
+                    (target_id, _upper(dst.get("name")), phone, _upper(address),
+                     now_str(), source_id))
+        bills_moved = cur.rowcount or 0
+
+        cur.execute("UPDATE customer_ledger SET customer_id=? WHERE customer_id=?",
+                    (target_id, source_id))
+        ledger_moved = cur.rowcount or 0
+
+        cur.execute("DELETE FROM customers WHERE id=?", (source_id,))
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+    bump("customers", "bills")
+    return {
+        "merged_name": src.get("name"),
+        "kept_name": dst.get("name"),
+        "bills_moved": bills_moved,
+        "ledger_moved": ledger_moved,
+    }
+
+
 def delete_customer(customer_id):
     conn = get_connection()
     conn.execute("DELETE FROM customers WHERE id=?", (customer_id,))
@@ -1600,16 +1701,74 @@ def set_track_khata(enabled):
     set_setting("track_khata", "1" if enabled else "0")
 
 
+AUTH_DEVICE_KEY = "auth_device"
+
+
 def is_auth_enabled():
     """Whether the app requires a login. Stored as a setting so that an
     existing installation upgrades to the new version with authentication
     switched OFF and behaving exactly as before, until the owner turns it
-    on deliberately."""
-    return get_setting("auth_enabled", "0") == "1" and count_users() > 0
+    on deliberately.
+
+    Requires a live OWNER account, not merely a user. A database whose
+    only accounts are staff can never reach Settings, Users or Backups
+    again through any screen in the app - it is locked, and locked
+    against the one person entitled to unlock it. Treating that state as
+    "sign-in is not really set up" is the only reading that leaves the
+    shop with its own data. count_owners() already refuses to let the
+    last owner be deleted or demoted, so this is a backstop for a
+    database that arrived in that state, not a routine path.
+    """
+    return get_setting("auth_enabled", "0") == "1" and count_owners() > 0
 
 
 def set_auth_enabled(enabled):
     set_setting("auth_enabled", "1" if enabled else "0")
+    if enabled:
+        bind_auth_device()
+
+
+def bind_auth_device():
+    """Records which machine this database's sign-in belongs to. Called
+    when sign-in is switched on and on every successful OWNER login -
+    "the machine where the owner actually works" is the honest
+    definition, and it is one a staff account cannot fake."""
+    import security
+    set_setting(AUTH_DEVICE_KEY, security.device_fingerprint())
+
+
+def auth_device_state():
+    """(bound_to_this_machine, has_ever_been_bound).
+
+    Unbound means the database has not yet seen an owner sign in since
+    this version - a fresh install, or one upgrading from before device
+    binding existed. Both callers treat unbound the same way they treat
+    "bound somewhere else": the escape hatch is open, and it closes by
+    itself the first time the real owner signs in.
+    """
+    import security
+    stored = (get_setting(AUTH_DEVICE_KEY, "") or "").strip()
+    if not stored:
+        return False, False
+    return stored == security.device_fingerprint(), True
+
+
+def can_claim_device():
+    """True when this app may offer to create an owner account without an
+    existing password.
+
+    Only when sign-in cannot currently be satisfied on this machine:
+    either no owner account exists at all, or the database is bound to a
+    different machine (it was copied here), or it has never been bound.
+    On the machine it belongs to, with an owner present, this is always
+    False - there is no bypass to find.
+    """
+    if count_owners() == 0:
+        return True
+    if get_setting("auth_enabled", "0") != "1":
+        return False          # not locked - the normal Users screen applies
+    bound_here, ever_bound = auth_device_state()
+    return not bound_here or not ever_bound
 
 
 def count_users(active_only=True):
@@ -1667,7 +1826,10 @@ def create_user(username, password, role, display_name="", recovery_code=None):
     if role not in security.ROLES:
         raise ValueError("Unknown role.")
 
-    recovery_hash = security.hash_password(recovery_code) if recovery_code else ""
+    # Normalised before hashing so it matches what verify_recovery_code()
+    # compares against, however the code gets typed back in later.
+    recovery_hash = (security.hash_password(security.normalize_recovery_code(recovery_code))
+                     if recovery_code else "")
 
     conn = get_connection()
     try:
@@ -1798,6 +1960,11 @@ def authenticate(username, password):
             conn.close()
         log_audit("login.success", "Signed in as " + user["role"],
                   as_username=user["username"], as_role=user["role"])
+        # An owner signing in here is what makes this THE machine for this
+        # database (see bind_auth_device). It also closes the new-device
+        # escape hatch on this machine from now on.
+        if user["role"] == security.ROLE_OWNER:
+            bind_auth_device()
         return get_user(user["id"]), ""
 
     # --- failed attempt ---
@@ -2320,36 +2487,131 @@ def set_employee_active(employee_id, active):
     conn.close()
 
 
+# A half-day can be worked, taken as leave, or missed. "half" is not one
+# of these: it is what a DAY looks like when its two halves disagree, and
+# is derived rather than stored (see _day_status).
+SESSION_STATUSES = ("present", "absent", "leave")
+
+
+def _day_status(am, pm):
+    """The one-word summary of a day, from its two halves.
+
+    Kept in the old `status` column so that everything written before
+    half-days existed - backup files, an older build opening this
+    database, the whitelist in backup_restore - still reads a value it
+    understands.
+    """
+    if am == pm:
+        return am                      # present / absent / leave, or None
+    if am is None or pm is None:
+        # Only one half marked. Worked-and-unmarked reads as a half day;
+        # anything else takes the colour of the half that was recorded.
+        return "half" if (am or pm) == "present" else (am or pm)
+    return "half"
+
+
 def get_attendance_month(period_month):
-    """{employee_id: {date: {"status":..., "shifts":...}}} for one 'YYYY-MM'."""
+    """{employee_id: {date: {"status", "am", "pm", "shifts"}}} for one
+    'YYYY-MM'. `status` is the day summary; `am`/`pm` are the real
+    record."""
     conn = get_connection()
     rows = conn.execute(
-        "SELECT employee_id, date, status, shifts FROM attendance WHERE substr(date, 1, 7) = ?",
+        "SELECT employee_id, date, status, am_status, pm_status, shifts "
+        "FROM attendance WHERE substr(date, 1, 7) = ?",
         (period_month,)
     ).fetchall()
     conn.close()
     out = {}
     for r in rows:
-        out.setdefault(r["employee_id"], {})[r["date"]] = {"status": r["status"], "shifts": r["shifts"]}
+        out.setdefault(r["employee_id"], {})[r["date"]] = {
+            "status": r["status"], "am": r["am_status"], "pm": r["pm_status"],
+            "shifts": r["shifts"],
+        }
     return out
 
 
-def mark_attendance(employee_id, date_str, status, shifts=None):
-    """status='clear' removes the mark for that day (an accidental drag,
-    or a day the owner wants to leave blank rather than 'absent')."""
+def mark_attendance_session(employee_id, date_str, session, status):
+    """Marks ONE half of one day. session is 'am' or 'pm'; status is
+    present/absent/leave, or 'clear' to unmark that half.
+
+    The day's summary status is recomputed from both halves, and a day
+    with neither half marked is deleted outright rather than left as an
+    empty row - blank has to stay genuinely blank, or a stray drag would
+    quietly become a permanent record.
+    """
+    session = "pm" if session == "pm" else "am"
+    if status == "clear":
+        status = None
+    elif status not in SESSION_STATUSES:
+        raise ValueError("Unknown attendance status.")
+
     conn = get_connection()
     cur = conn.cursor()
-    if status == "clear":
-        cur.execute("DELETE FROM attendance WHERE employee_id=? AND date=?", (employee_id, date_str))
-    else:
-        cur.execute("""
-            INSERT INTO attendance (employee_id, date, status, shifts, marked_at)
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(employee_id, date) DO UPDATE SET
-                status=excluded.status, shifts=excluded.shifts, marked_at=excluded.marked_at
-        """, (employee_id, date_str, status, shifts if shifts is not None else 1, now_str()))
-    conn.commit()
-    conn.close()
+    try:
+        row = cur.execute(
+            "SELECT am_status, pm_status FROM attendance WHERE employee_id=? AND date=?",
+            (employee_id, date_str)).fetchone()
+        am = row["am_status"] if row else None
+        pm = row["pm_status"] if row else None
+        if session == "am":
+            am = status
+        else:
+            pm = status
+
+        if am is None and pm is None:
+            cur.execute("DELETE FROM attendance WHERE employee_id=? AND date=?",
+                        (employee_id, date_str))
+        else:
+            # shifts counts the halves actually worked, so "per shift" pay
+            # adds up without anyone having to type a number.
+            shifts = sum(1 for s in (am, pm) if s == "present")
+            cur.execute("""
+                INSERT INTO attendance (employee_id, date, status, am_status, pm_status, shifts, marked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(employee_id, date) DO UPDATE SET
+                    status=excluded.status, am_status=excluded.am_status,
+                    pm_status=excluded.pm_status, shifts=excluded.shifts,
+                    marked_at=excluded.marked_at
+            """, (employee_id, date_str, _day_status(am, pm), am, pm, shifts, now_str()))
+        conn.commit()
+    finally:
+        conn.close()
+    return {"am": am, "pm": pm, "status": _day_status(am, pm)}
+
+
+def mark_attendance(employee_id, date_str, status, shifts=None):
+    """Marks a WHOLE day at once - both halves together.
+
+    status='clear' removes the day (an accidental drag, or a day the
+    owner wants to leave blank rather than 'absent'). 'half' is accepted
+    for what it has always meant: the morning worked and the evening not.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        if status == "clear":
+            cur.execute("DELETE FROM attendance WHERE employee_id=? AND date=?",
+                        (employee_id, date_str))
+        else:
+            if status == "half":
+                am, pm = "present", "absent"
+            elif status in SESSION_STATUSES:
+                am = pm = status
+            else:
+                raise ValueError("Unknown attendance status.")
+            worked = sum(1 for s in (am, pm) if s == "present")
+            cur.execute("""
+                INSERT INTO attendance (employee_id, date, status, am_status, pm_status, shifts, marked_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(employee_id, date) DO UPDATE SET
+                    status=excluded.status, am_status=excluded.am_status,
+                    pm_status=excluded.pm_status, shifts=excluded.shifts,
+                    marked_at=excluded.marked_at
+            """, (employee_id, date_str, status, am, pm,
+                  shifts if shifts is not None else worked, now_str()))
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def add_advance(employee_id, date_str, amount, notes=""):
@@ -2394,12 +2656,25 @@ def compute_payroll(employee_id, period_month):
     """Pure calculation for one employee, one 'YYYY-MM' - never writes
     anything. finalize_payroll() below is what saves it.
 
-    Monthly staff are paid pro-rata by the days in that calendar month
-    (rate / days_in_month x effective_days); daily-wage staff are paid
-    per day worked; shift-based staff are paid per shift logged. A paid
-    leave day and a present day count the same; a half-day counts half;
-    an absent day earns nothing - this is a simple, transparent default
-    the owner can see broken down before ever finalizing a month.
+    HOW EACH PAY TYPE IS WORKED OUT
+
+      Daily wage  - paid for the time actually worked. Each half-day
+                    present is half a day's wage; paid leave counts the
+                    same as worked; absent earns nothing.
+      Per shift   - paid per half-day present. Morning and evening are
+                    two shifts, which is what "per shift" means in a
+                    shop that opens twice a day.
+      Fixed monthly - the full salary, MINUS the halves marked absent.
+                    This is the important one, and it is the opposite of
+                    how it used to work: pay used to ACCRUE from marked
+                    days, so a fixed-salary employee whose month was only
+                    half filled in was silently paid half, and forgetting
+                    to mark a day cost them money. A fixed salary is
+                    fixed; an unmarked day is a normal day; only a
+                    recorded absence is a deduction.
+
+    An employee who joined part-way through the month is paid from their
+    joining date, not the 1st.
     """
     emp = get_employee(employee_id)
     if not emp:
@@ -2409,36 +2684,71 @@ def compute_payroll(employee_id, period_month):
 
     conn = get_connection()
     rows = conn.execute(
-        "SELECT status, shifts FROM attendance WHERE employee_id=? AND substr(date, 1, 7)=?",
+        "SELECT date, status, am_status, pm_status FROM attendance "
+        "WHERE employee_id=? AND substr(date, 1, 7)=?",
         (employee_id, period_month)
     ).fetchall()
     conn.close()
 
-    present = sum(1 for r in rows if r["status"] == "present")
-    half = sum(1 for r in rows if r["status"] == "half")
-    absent = sum(1 for r in rows if r["status"] == "absent")
-    leave = sum(1 for r in rows if r["status"] == "leave")
-    shifts_total = sum((r["shifts"] or 0) for r in rows if r["status"] in ("present", "half"))
+    # Everything is counted in HALVES and halved at the end, so a day
+    # worked in the morning only is 0.5 wherever it appears.
+    sessions = {"present": 0, "absent": 0, "leave": 0}
+    mixed_days = 0
+    for r in rows:
+        am, pm = r["am_status"], r["pm_status"]
+        if am is None and pm is None:
+            # A row written before half-days existed and somehow not
+            # migrated - fall back to its day status so it still counts.
+            legacy = r["status"]
+            am = pm = legacy if legacy in SESSION_STATUSES else None
+            if legacy == "half":
+                am, pm = "present", "absent"
+        for s in (am, pm):
+            if s in sessions:
+                sessions[s] += 1
+        if am != pm:
+            mixed_days += 1
+
+    present_days = sessions["present"] / 2.0
+    absent_days = sessions["absent"] / 2.0
+    leave_days = sessions["leave"] / 2.0
+    shifts_total = sessions["present"]          # one shift per half-day worked
 
     pay_type = emp["pay_type"]
     rate = emp["pay_rate"] or 0
-    effective_days = present + leave + 0.5 * half
+    paid_days = present_days + leave_days       # leave is paid time
 
     if pay_type == "daily":
-        gross = round(rate * effective_days, 2)
+        gross = round(rate * paid_days, 2)
     elif pay_type == "shift":
         gross = round(rate * shifts_total, 2)
-    else:  # "monthly"
-        gross = round(rate / days_in_month * effective_days, 2) if days_in_month else 0.0
+    else:  # "monthly" - full salary less recorded absences
+        per_day = (rate / days_in_month) if days_in_month else 0.0
+        entitled_days = days_in_month
+        joined = (emp.get("joined_date") or "").strip()
+        if len(joined) == 10 and joined[:7] == period_month:
+            try:
+                entitled_days = days_in_month - int(joined[8:10]) + 1
+            except ValueError:
+                entitled_days = days_in_month
+        gross = round(per_day * max(0.0, entitled_days - absent_days), 2)
 
-    unsettled = get_advances(employee_id, unsettled_only=True)
+    # Only advances taken up to the END of this month are deducted from
+    # it. Without the date bound, opening last month's payroll would
+    # deduct money handed over since - and finalizing it would settle
+    # those advances against the wrong month, so the month they belong to
+    # would then show no deduction at all.
+    month_end = f"{period_month}-{days_in_month:02d}"
+    unsettled = [a for a in get_advances(employee_id, unsettled_only=True)
+                 if (a.get("date") or "") <= month_end]
     advances_total = round(sum(a["amount"] for a in unsettled), 2)
     net = round(gross - advances_total, 2)
 
     return {
         "employee_id": employee_id, "employee_name": emp["name"], "period_month": period_month,
         "pay_type": pay_type, "pay_rate": rate, "days_in_month": days_in_month,
-        "present_days": present, "half_days": half, "absent_days": absent, "leave_days": leave,
+        "present_days": present_days, "half_days": mixed_days,
+        "absent_days": absent_days, "leave_days": leave_days,
         "shifts_total": shifts_total, "gross_pay": gross,
         "advances_deducted": advances_total, "advance_ids": [a["id"] for a in unsettled],
         "net_pay": net,
@@ -2447,38 +2757,62 @@ def compute_payroll(employee_id, period_month):
 
 def finalize_payroll(employee_id, period_month):
     """Saves compute_payroll()'s numbers as a payroll_runs row and marks
-    every advance it deducted as settled against that run. Safe to call
-    again for the same employee+month before it is marked paid - it
-    replaces the previous (still-pending) numbers rather than doubling up,
-    thanks to the table's UNIQUE(employee_id, period_month)."""
+    every advance it deducted as settled against that run.
+
+    Safe to run again for the same employee+month while it is still
+    pending - which matters, because attendance gets corrected after a
+    month is first totalled up. Re-running used to quietly destroy the
+    advance deduction: the first run settled the advances, so the second
+    run's fresh calculation could no longer see them and saved a zero
+    deduction over the real one, handing the employee money they had
+    already been given. Any advance settled against THIS run is therefore
+    released before recomputing, so the second run sees exactly what the
+    first one saw.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    try:
+        existing = cur.execute(
+            "SELECT id, status FROM payroll_runs WHERE employee_id=? AND period_month=?",
+            (employee_id, period_month)).fetchone()
+        if existing is not None:
+            cur.execute("UPDATE employee_advances SET settled=0, payroll_id=NULL WHERE payroll_id=?",
+                        (existing["id"],))
+            conn.commit()
+    finally:
+        conn.close()
+
     calc = compute_payroll(employee_id, period_month)
     if calc is None:
         return None
+
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO payroll_runs (employee_id, period_month, present_days, half_days, absent_days, leave_days,
-                                   gross_pay, advances_deducted, net_pay, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
-        ON CONFLICT(employee_id, period_month) DO UPDATE SET
-            present_days=excluded.present_days, half_days=excluded.half_days,
-            absent_days=excluded.absent_days, leave_days=excluded.leave_days,
-            gross_pay=excluded.gross_pay, advances_deducted=excluded.advances_deducted,
-            net_pay=excluded.net_pay
-    """, (employee_id, period_month, calc["present_days"], calc["half_days"], calc["absent_days"],
-          calc["leave_days"], calc["gross_pay"], calc["advances_deducted"], calc["net_pay"], now_str()))
-    conn.commit()
-    payroll_id = conn.execute(
-        "SELECT id FROM payroll_runs WHERE employee_id=? AND period_month=?",
-        (employee_id, period_month)
-    ).fetchone()["id"]
-    if calc["advance_ids"]:
-        cur.executemany("UPDATE employee_advances SET settled=1, payroll_id=? WHERE id=?",
-                         [(payroll_id, aid) for aid in calc["advance_ids"]])
+    try:
+        cur.execute("""
+            INSERT INTO payroll_runs (employee_id, period_month, present_days, half_days, absent_days, leave_days,
+                                       gross_pay, advances_deducted, net_pay, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            ON CONFLICT(employee_id, period_month) DO UPDATE SET
+                present_days=excluded.present_days, half_days=excluded.half_days,
+                absent_days=excluded.absent_days, leave_days=excluded.leave_days,
+                gross_pay=excluded.gross_pay, advances_deducted=excluded.advances_deducted,
+                net_pay=excluded.net_pay
+        """, (employee_id, period_month, calc["present_days"], calc["half_days"], calc["absent_days"],
+              calc["leave_days"], calc["gross_pay"], calc["advances_deducted"], calc["net_pay"], now_str()))
+        payroll_id = cur.execute(
+            "SELECT id FROM payroll_runs WHERE employee_id=? AND period_month=?",
+            (employee_id, period_month)).fetchone()["id"]
+        if calc["advance_ids"]:
+            cur.executemany("UPDATE employee_advances SET settled=1, payroll_id=? WHERE id=?",
+                            [(payroll_id, aid) for aid in calc["advance_ids"]])
         conn.commit()
-    conn.close()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
     return payroll_id
-
 
 def mark_payroll_paid(payroll_id, paid_date=None):
     conn = get_connection()

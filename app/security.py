@@ -32,7 +32,9 @@ import base64
 import hashlib
 import hmac
 import os
+import platform
 import secrets
+import uuid
 from datetime import datetime, timedelta
 
 # ---------------- PASSWORD HASHING ----------------
@@ -300,6 +302,47 @@ def format_remaining(delta):
         mins = (total + 59) // 60
         return f"{mins} minute{'s' if mins != 1 else ''}"
     return f"{total} second{'s' if total != 1 else ''}"
+
+
+# ---------------- WHICH MACHINE IS THIS ----------------
+#
+# A shop's whole database is one file, and it travels: onto a pendrive,
+# onto the replacement computer, onto the laptop at home. When it lands
+# somewhere new with "Require sign-in" switched on, the person carrying
+# it is locked out of their own books - the accounts inside were made on
+# the old machine, and creating a new one needs the very permission they
+# cannot get. That is a data-loss bug wearing a security costume.
+#
+# The fix is to know whether this database has ever actually been USED on
+# this machine. A fingerprint of the machine is stored in the database
+# the first time an owner signs in here; if the fingerprint that comes
+# back does not match, the database has moved, and the app offers to set
+# up an owner account on this device.
+#
+# What this deliberately does NOT do is offer that anywhere else. On the
+# machine the database is bound to, there is no such escape hatch, so a
+# staff member at the counter cannot use it to promote themselves - which
+# is the only threat this app's sign-in was ever really defending
+# against. Anyone holding the file itself can already read every bill in
+# it with any SQLite browser; pretending otherwise would just mean the
+# owner is the only person the lock actually works on.
+
+def device_fingerprint():
+    """A stable, non-identifying id for this machine.
+
+    Hostname plus MAC address, hashed - the hash is what gets stored, so
+    the database never carries the shop's machine name or MAC around on a
+    pendrive. A MAC that Python had to invent (the "locally administered"
+    bit is set when it cannot read a real one) is left out, because it is
+    random per process and would make every launch look like a new
+    machine.
+    """
+    parts = [platform.system() or "", (platform.node() or "").strip().lower()]
+    node = uuid.getnode()
+    if not (node >> 40) & 1:
+        parts.append(f"{node:012x}")
+    raw = "|".join(parts)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 
 # ---------------- MISC ----------------

@@ -27,13 +27,17 @@ const TABS = [
   { id: 'payroll',   label: 'Payroll',    icon: 'card' },
 ];
 
-const STATUS_CYCLE = [null, 'present', 'half', 'absent', 'leave'];
+/* A day is two halves - morning and evening - each marked on its own.
+   "Half day" is therefore no longer something you pick: it is what a day
+   IS when its two halves differ, which is why it appears in the totals
+   and the legend but not in the cycle. */
+const STATUS_CYCLE = [null, 'present', 'absent', 'leave'];
 const STATUS_DEF = {
   present: { letter: 'P', bg: 'var(--ok-soft)',   ink: 'var(--ok-ink)',   title: 'Present' },
-  half:    { letter: 'H', bg: 'var(--warn-soft)', ink: 'var(--warn-ink)', title: 'Half day' },
   absent:  { letter: 'A', bg: 'var(--bad-soft)',  ink: 'var(--bad-ink)',  title: 'Absent' },
   leave:   { letter: 'L', bg: 'var(--info-soft)', ink: 'var(--info-ink)', title: 'On leave' },
 };
+const SESSION_LABEL = { am: 'Morning', pm: 'Evening' };
 const PAY_TYPE_LABEL = { monthly: 'Fixed monthly', daily: 'Daily wage', shift: 'Per shift' };
 
 let S = null;
@@ -68,7 +72,15 @@ export default {
 };
 
 /* ============================ date helpers ============================ */
-function todayMonth() { return new Date().toISOString().slice(0, 7); }
+function todayMonth() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`;
+}
+
+function todayISO() {
+  const d = new Date();
+  return `${todayMonth()}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 function monthLabel(m) {
   const [y, mo] = m.split('-');
@@ -121,13 +133,103 @@ function paint(root) {
   S.el = { body: q('#secBody', root) };
 }
 
+/* Every listener on this screen is delegated from S.root and attached
+   ONCE, here. It used to be re-attached at the end of every render, and
+   core.js's on() has no removal path, so handlers stacked up: three
+   visits to Payroll meant one click on Finalize firing three confirms
+   and three finalize calls. That is the "glitches" half of the bug
+   report. Anything added below must stay in this function. */
 function wire() {
   on(S.root, 'click', '[data-tab]', (e, b) => {
     S.active = b.dataset.tab;
     prefs.set('attendanceTab', S.active);
     qa('[data-tab]', S.root).forEach(x => x.classList.toggle('on', x === b));
-    renderSection();
+    // Fetch, don't just re-render. Each tab used to draw whatever was in
+    // memory from when the screen was first opened, so attendance marked
+    // a moment earlier simply wasn't in the numbers Payroll showed - and
+    // the Attendance grid could come up blank and then overwrite real
+    // marks when clicked.
+    loadAndRender();
   });
+
+  on(S.root, 'click', '[data-mnav]', (e, b) => {
+    S.month = shiftMonth(S.month, +b.dataset.mnav);
+    loadAndRender();
+  });
+
+  /* ---- attendance grid ---- */
+  on(S.root, 'mousedown', '.at-half', (e, halfEl) => {
+    e.preventDefault();
+    const { emp, date, session } = halfEl.dataset;
+    const empId = +emp;
+    const cur = S.grid[empId]?.[date]?.[session] || null;
+    const next = cycleStatus(cur);
+    paintHalf(empId, date, session, next);
+    S.drag = { empId, session, status: next };
+  });
+  on(S.root, 'mouseover', '.at-half', (e, halfEl) => {
+    if (!S.drag) return;
+    const { emp, date, session } = halfEl.dataset;
+    // A drag paints one employee's one half-of-day across the month -
+    // never the other session, and never someone else's row.
+    if (+emp !== S.drag.empId || session !== S.drag.session) return;
+    paintHalf(+emp, date, session, S.drag.status);
+  });
+  // Marking a whole day at once, without four clicks: the day number.
+  on(S.root, 'click', '.at-day-all', (e, b) => {
+    const empId = +b.dataset.emp, date = b.dataset.date;
+    const rec = S.grid[empId]?.[date];
+    const cur = (rec && rec.am === rec.pm) ? rec.am : null;
+    const next = cycleStatus(cur);
+    paintHalf(empId, date, 'am', next, { silent: true });
+    paintHalf(empId, date, 'pm', next, { silent: true });
+    api.mark_attendance(empId, date, next || 'clear')
+      .catch(err => toast('Could not save', err.message, 'bad'));
+  });
+
+  /* ---- employees ---- */
+  on(S.root, 'click', '#addEmployee', () => openEmployeeModal(null));
+  on(S.root, 'click', '[data-eact]', async (e, b) => {
+    const emp = S.employees.find(x => x.id === +b.dataset.eid);
+    if (!emp) return;
+    if (b.dataset.eact === 'edit') return openEmployeeModal(emp);
+    const yes = await confirm(emp.active ? 'Deactivate this employee?' : 'Reactivate this employee?',
+      emp.active ? `${emp.name} will drop off the attendance grid and payroll. Their history is kept.`
+                 : `${emp.name} will reappear on the attendance grid and payroll.`);
+    if (!yes) return;
+    try { await api.set_employee_active(emp.id, !emp.active); await reload(); }
+    catch (err) { toast('Could not update', err.message, 'bad'); }
+  });
+
+  /* ---- advances ---- */
+  on(S.root, 'click', '#addAdvance', openAdvanceModal);
+  on(S.root, 'click', '[data-adel]', async (e, b) => {
+    const yes = await confirm('Delete this advance?', 'This cannot be undone.', { danger: true, ok: 'Delete' });
+    if (!yes) return;
+    try { await api.delete_advance(+b.dataset.adel); await loadAndRender(); }
+    catch (err) { toast('Could not delete', err.message, 'bad'); }
+  });
+
+  /* ---- payroll ---- */
+  on(S.root, 'click', '[data-finalize]', async (e, b) => {
+    const empId = +b.dataset.finalize;
+    const emp = S.employees.find(x => x.id === empId);
+    const already = S.payrollHistory.find(r => r.employee_id === empId && r.period_month === S.month);
+    const yes = await confirm(already ? 'Re-finalize this month?' : 'Finalize payroll?',
+      `${already ? 'This replaces the saved figures for ' : 'This locks in '}`
+      + `${emp?.name || 'this employee'}'s pay for ${monthLabel(S.month)} with the attendance as it `
+      + `stands now, and settles their pending advances against it. You can still mark it paid afterwards.`);
+    if (!yes) return;
+    try { await api.finalize_payroll(empId, S.month); toast('Payroll finalized', '', 'ok'); await loadAndRender(); }
+    catch (err) { toast('Could not finalize', err.message, 'bad'); }
+  });
+  on(S.root, 'click', '[data-payid]', async (e, b) => {
+    try { await api.mark_payroll_paid(+b.dataset.payid); await loadAndRender(); }
+    catch (err) { toast('Could not update', err.message, 'bad'); }
+  });
+
+  S._mouseup = () => { S.drag = null; };
+  document.addEventListener('mouseup', S._mouseup);
 }
 
 async function reload() {
@@ -152,8 +254,12 @@ async function loadTabData() {
     S.advances = await api.list_advances();
   } else if (S.active === 'payroll') {
     const active = S.employees.filter(e => e.active);
+    // Both are computed fresh from the attendance as it stands right
+    // now. History is asked for THIS month only - it used to be every
+    // month ever, sitting directly under a month navigator that did not
+    // change it.
     S.payrollPreviews = await Promise.all(active.map(e => api.payroll_preview(e.id, S.month)));
-    S.payrollHistory = await api.payroll_runs();
+    S.payrollHistory = await api.payroll_runs(S.month);
   }
 }
 
@@ -162,16 +268,15 @@ function renderSection() {
   if (S.loading) { host.innerHTML = `<div class="col grow center" style="padding:40px"><div class="skel" style="width:220px;height:20px"></div></div>`; return; }
   const fn = { grid: sectionGrid, employees: sectionEmployees, advances: sectionAdvances, payroll: sectionPayroll }[S.active];
   host.innerHTML = fn ? fn() : '';
-  wireSection();
 }
 
 /* ============================ Attendance grid ============================ */
 function monthNavHTML() {
   return `
     <div class="row gap2" style="align-items:center">
-      <button class="btn btn-ghost btn-icon btn-sm" id="prevMonth">${icon('chevLeft', 15)}</button>
+      <button class="btn btn-ghost btn-icon btn-sm" data-mnav="-1" title="Previous month">${icon('chevLeft', 15)}</button>
       <div class="h2" style="min-width:150px;text-align:center">${esc(monthLabel(S.month))}</div>
-      <button class="btn btn-ghost btn-icon btn-sm" id="nextMonth" ${S.month >= todayMonth() ? 'disabled' : ''}>${icon('chevRight', 15)}</button>
+      <button class="btn btn-ghost btn-icon btn-sm" data-mnav="1" title="Next month" ${S.month >= todayMonth() ? 'disabled' : ''}>${icon('chevRight', 15)}</button>
     </div>`;
 }
 
@@ -191,20 +296,26 @@ function sectionGrid() {
 
   const rows = active.map(emp => {
     const rec = S.grid[emp.id] || {};
-    let p = 0, h = 0, a = 0, l = 0;
+    const t = rowTotals(rec, S.month);
     const cells = days.map(d => {
       const date = dateOf(S.month, d);
-      const st = rec[date]?.status || null;
-      if (st === 'present') p++; else if (st === 'half') h++; else if (st === 'absent') a++; else if (st === 'leave') l++;
-      const def = st ? STATUS_DEF[st] : null;
-      return `<button class="at-cell ${d === today ? 'is-today' : ''}" data-emp="${emp.id}" data-date="${date}"
-        title="${def ? def.title : 'Not marked'} — click to change, drag across days to fill"
-        style="${def ? `background:${def.bg};color:${def.ink}` : ''}">${def ? def.letter : ''}</button>`;
+      const day = rec[date] || {};
+      return `<div class="at-cell ${d === today ? 'is-today' : ''}">
+        ${['am', 'pm'].map(sn => {
+          const st = day[sn] || null;
+          const def = st ? STATUS_DEF[st] : null;
+          return `<button class="at-half" data-emp="${emp.id}" data-date="${date}" data-session="${sn}"
+            title="${SESSION_LABEL[sn]} ${d} — ${def ? def.title : 'not marked'}"
+            style="${def ? `background:${def.bg};color:${def.ink}` : ''}">${def ? def.letter : ''}</button>`;
+        }).join('')}
+        <button class="at-day-all" data-emp="${emp.id}" data-date="${date}"
+          title="Mark the whole day"></button>
+      </div>`;
     }).join('');
     return `<div class="at-row">
       <div class="at-name ellipsis" title="${esc(emp.name)}">${esc(emp.name)}</div>
       <div class="at-cells">${cells}</div>
-      <div class="at-totals tiny muted mono">P ${p} · H ${h} · A ${a} · L ${l}</div>
+      <div class="at-totals tiny muted mono" data-tot="${emp.id}">${totalsText(t)}</div>
     </div>`;
   }).join('');
 
@@ -214,9 +325,14 @@ function sectionGrid() {
       <div class="row gap3">
         ${Object.entries(STATUS_DEF).map(([k, d]) => `<span class="tiny" style="display:inline-flex;align-items:center;gap:4px">
           <i style="width:14px;height:14px;border-radius:4px;display:inline-block;background:${d.bg};color:${d.ink};text-align:center;line-height:14px;font-size:10px;font-weight:700">${d.letter}</i>${d.title}</span>`).join('')}
+        <span class="tiny muted">· a day with one half worked counts as half</span>
       </div>
     </div>
-    <div class="tiny muted" style="padding:0 16px 8px">Click a day to cycle Present → Half → Absent → Leave → blank. Click and drag across a row to paint several days at once.</div>
+    <div class="tiny muted" style="padding:0 16px 8px">
+      Each day is split: the <b>top</b> half is the morning, the <b>bottom</b> half the evening.
+      Click either to cycle Present → Absent → Leave → blank, or click the thin strip between
+      them to set the whole day. Drag sideways to fill the same half across several days.
+    </div>
     <div class="grow" style="padding:0 16px 16px;overflow:auto;overscroll-behavior:contain">
       <div class="at-grid" id="atGrid" style="--days:${nDays}">
         <div class="at-row at-row-head">
@@ -229,48 +345,60 @@ function sectionGrid() {
     </div>`;
 }
 
+/** Days, counted in halves: a morning worked is half a present day. Kept
+    on this side too so the row totals move the instant a half is
+    clicked, without waiting for a round trip. */
+function rowTotals(rec, month) {
+  let present = 0, absent = 0, leave = 0, mixed = 0;
+  for (const date of Object.keys(rec)) {
+    if (!date.startsWith(month)) continue;
+    const { am = null, pm = null } = rec[date] || {};
+    for (const s of [am, pm]) {
+      if (s === 'present') present += 0.5;
+      else if (s === 'absent') absent += 0.5;
+      else if (s === 'leave') leave += 0.5;
+    }
+    if (am !== pm) mixed += 1;
+  }
+  return { present, absent, leave, mixed };
+}
+
+const fmtDays = (n) => (Math.round(n * 2) / 2).toString();
+
+function totalsText(t) {
+  return `P ${fmtDays(t.present)} · A ${fmtDays(t.absent)} · L ${fmtDays(t.leave)}`
+       + (t.mixed ? ` · ${t.mixed} half-day${t.mixed === 1 ? '' : 's'}` : '');
+}
+
 function cycleStatus(cur) {
   const i = STATUS_CYCLE.indexOf(cur);
   return STATUS_CYCLE[(i + 1) % STATUS_CYCLE.length];
 }
 
-function paintCell(empId, date, status) {
-  S.grid[empId] = S.grid[empId] || {};
-  if (status) S.grid[empId][date] = { status, shifts: 1 };
-  else delete S.grid[empId][date];
-  const cell = q(`.at-cell[data-emp="${empId}"][data-date="${date}"]`, S.root);
-  if (cell) {
+/** Marks one half of one day: repaints it immediately, updates that
+    employee's running totals, and saves. The payroll figures are not
+    touched here - they are recomputed from the database whenever the
+    Payroll tab is opened, which is the only way they can be trusted. */
+function paintHalf(empId, date, session, status, { silent = false } = {}) {
+  const rec = (S.grid[empId] = S.grid[empId] || {});
+  const day = (rec[date] = rec[date] || { am: null, pm: null });
+  day[session] = status;
+  if (!day.am && !day.pm) delete rec[date];
+
+  const el = q(`.at-half[data-emp="${empId}"][data-date="${date}"][data-session="${session}"]`, S.root);
+  if (el) {
     const def = status ? STATUS_DEF[status] : null;
-    cell.textContent = def ? def.letter : '';
-    cell.style.background = def ? def.bg : '';
-    cell.style.color = def ? def.ink : '';
+    el.textContent = def ? def.letter : '';
+    el.style.background = def ? def.bg : '';
+    el.style.color = def ? def.ink : '';
+    el.title = `${SESSION_LABEL[session]} ${date.slice(8)} — ${def ? def.title : 'not marked'}`;
   }
-  api.mark_attendance(empId, date, status || 'clear').catch(e =>
-    toast('Could not save', e.message, 'bad'));
-}
+  const tot = q(`[data-tot="${empId}"]`, S.root);
+  if (tot) tot.textContent = totalsText(rowTotals(rec, S.month));
 
-function wireGrid() {
-  const gridEl = q('#atGrid', S.root);
-  if (!gridEl) return;
-  q('#prevMonth', S.root)?.addEventListener('click', () => { S.month = shiftMonth(S.month, -1); loadAndRender(); });
-  q('#nextMonth', S.root)?.addEventListener('click', () => { S.month = shiftMonth(S.month, 1); loadAndRender(); });
-
-  on(gridEl, 'mousedown', '.at-cell', (e, cellEl) => {
-    e.preventDefault();
-    const empId = +cellEl.dataset.emp, date = cellEl.dataset.date;
-    const cur = S.grid[empId]?.[date]?.status || null;
-    const next = cycleStatus(cur);
-    paintCell(empId, date, next);
-    S.drag = { empId, status: next };
-  });
-  on(gridEl, 'mouseover', '.at-cell', (e, cellEl) => {
-    if (!S.drag) return;
-    const empId = +cellEl.dataset.emp, date = cellEl.dataset.date;
-    if (empId !== S.drag.empId) return;
-    paintCell(empId, date, S.drag.status);
-  });
-  S._mouseup = () => { S.drag = null; };
-  document.addEventListener('mouseup', S._mouseup);
+  if (silent) return;                      // the whole-day click saves once, for both halves
+  api.mark_attendance_session(empId, date, session, status || 'clear')
+    .catch(e => toast('Could not save', e.message, 'bad'));
 }
 
 async function loadAndRender() {
@@ -410,7 +538,7 @@ async function openAdvanceModal() {
       </select></div>
     <div class="row gap3">
       <div class="field"><label class="label">Date</label>
-        <input class="input mono" id="a-date" value="${new Date().toISOString().slice(0, 10)}"></div>
+        <input class="input mono" id="a-date" value="${todayISO()}"></div>
       <div class="field grow"><label class="label">Amount (Rs.)<span class="req">*</span></label>
         <input class="input" id="a-amount" inputmode="decimal" placeholder="0.00"></div>
     </div>
@@ -443,24 +571,41 @@ async function openAdvanceModal() {
 
 /* ============================ Payroll ============================ */
 function sectionPayroll() {
-  const previewRows = S.payrollPreviews.map(p => `
+  const savedFor = new Map(S.payrollHistory.map(r => [r.employee_id, r]));
+
+  const previewRows = S.payrollPreviews.map(p => {
+    const saved = savedFor.get(p.employee_id);
+    // A finalized month is a saved snapshot. Attendance marked after it
+    // was finalized changes the live figure and NOT the saved one, which
+    // is correct - but it has to be said, or it looks like payroll is
+    // ignoring the attendance that was just entered.
+    const drifted = saved && Math.abs((saved.net_pay || 0) - p.net_pay) > 0.009;
+    return `
     <div class="row between" style="padding:11px 16px;border-bottom:1px solid var(--line-soft)">
       <div class="col" style="min-width:0">
-        <div style="font-weight:600">${esc(p.employee_name)}</div>
-        <div class="tiny muted mono">P ${p.present_days} · H ${p.half_days} · A ${p.absent_days} · L ${p.leave_days}${p.pay_type === 'shift' ? ' · ' + p.shifts_total + ' shifts' : ''}</div>
+        <div style="font-weight:600">${esc(p.employee_name)}
+          <span class="tiny muted">— ${esc(PAY_TYPE_LABEL[p.pay_type] || p.pay_type)} ${inr(p.pay_rate)}</span></div>
+        <div class="tiny muted mono">Present ${p.present_days} · Absent ${p.absent_days} · Leave ${p.leave_days}${
+          p.half_days ? ` · ${p.half_days} half-day${p.half_days === 1 ? '' : 's'}` : ''}${
+          p.pay_type === 'shift' ? ` · ${p.shifts_total} shift${p.shifts_total === 1 ? '' : 's'}` : ''}</div>
+        ${drifted ? `<div class="tiny" style="color:var(--warn-ink)">
+          Attendance has changed since this month was finalized (saved: ${inr(saved.net_pay)}).
+          Finalize again to update it.</div>` : ''}
       </div>
       <div class="row gap4" style="align-items:center;flex:none">
         <div class="tiny muted mono" style="text-align:right">Gross ${inr(p.gross_pay)}${p.advances_deducted ? `<br>Advances -${inr(p.advances_deducted)}` : ''}</div>
         <div class="mono" style="font-weight:700;min-width:90px;text-align:right">${inr(p.net_pay)}</div>
-        <button class="btn btn-primary btn-sm" data-finalize="${p.employee_id}">${icon('save', 14)}Finalize</button>
+        <button class="btn ${drifted ? 'btn-primary' : saved ? 'btn-ghost' : 'btn-primary'} btn-sm"
+          data-finalize="${p.employee_id}">${icon('save', 14)}${saved ? 'Re-finalize' : 'Finalize'}</button>
       </div>
-    </div>`).join('');
+    </div>`;
+  }).join('');
 
   const historyRows = S.payrollHistory.map(r => `
     <div class="row between" style="padding:9px 16px;border-bottom:1px solid var(--line-soft)">
       <div class="col">
         <div>${esc(r.employee_name)} <span class="tiny muted">— ${esc(r.period_month)}</span></div>
-        <div class="tiny muted">${r.status === 'paid' ? 'Paid ' + esc(r.paid_date || '') : 'Pending'}</div>
+        <div class="tiny muted">${r.status === 'paid' ? 'Paid ' + esc(r.paid_date || '') : 'Finalized, not yet paid'}</div>
       </div>
       <div class="row gap3" style="align-items:center">
         <span class="mono">${inr(r.net_pay)}</span>
@@ -472,53 +617,23 @@ function sectionPayroll() {
   return `
     <div class="panel-head">${monthNavHTML()}</div>
     <div class="grow scroll-y">
-      <div class="panel-head" style="padding-top:0"><div class="h2 grow">This month</div></div>
+      <div class="panel-head" style="padding-top:0">
+        <div class="col grow">
+          <div class="h2">Working out now</div>
+          <div class="tiny muted">Calculated from the attendance for ${esc(monthLabel(S.month))} as it stands
+            this moment — it moves as soon as you change a day on the Attendance tab.</div>
+        </div>
+      </div>
       ${S.payrollPreviews.length ? previewRows : emptyState('card', 'No active employees', 'Add employees to run payroll.')}
-      <div class="panel-head"><div class="h2 grow">History</div></div>
-      ${S.payrollHistory.length ? historyRows : emptyState('history', 'No payroll finalized yet', 'Finalized months appear here.')}
+      <div class="panel-head">
+        <div class="col grow">
+          <div class="h2">Finalized for ${esc(monthLabel(S.month))}</div>
+          <div class="tiny muted">Saved figures, frozen at the moment they were finalized.</div>
+        </div>
+      </div>
+      ${S.payrollHistory.length ? historyRows
+        : emptyState('history', 'Nothing finalized for this month', 'Finalize an employee above to lock their figures in.')}
     </div>`;
 }
 
-/* ============================ per-tab wiring ============================ */
-function wireSection() {
-  if (S.active === 'grid') { wireGrid(); return; }
 
-  if (S.active === 'employees') {
-    q('#addEmployee', S.root)?.addEventListener('click', () => openEmployeeModal(null));
-    on(S.root, 'click', '[data-eact]', async (e, b) => {
-      const emp = S.employees.find(x => x.id === +b.dataset.eid);
-      if (!emp) return;
-      if (b.dataset.eact === 'edit') return openEmployeeModal(emp);
-      const yes = await confirm(emp.active ? 'Deactivate this employee?' : 'Reactivate this employee?',
-        emp.active ? `${emp.name} will drop off the attendance grid and payroll. Their history is kept.`
-                   : `${emp.name} will reappear on the attendance grid and payroll.`);
-      if (!yes) return;
-      try { await api.set_employee_active(emp.id, !emp.active); await reload(); }
-      catch (err) { toast('Could not update', err.message, 'bad'); }
-    });
-  } else if (S.active === 'advances') {
-    q('#addAdvance', S.root)?.addEventListener('click', openAdvanceModal);
-    on(S.root, 'click', '[data-adel]', async (e, b) => {
-      const yes = await confirm('Delete this advance?', 'This cannot be undone.', { danger: true, ok: 'Delete' });
-      if (!yes) return;
-      try { await api.delete_advance(+b.dataset.adel); await loadAndRender(); }
-      catch (err) { toast('Could not delete', err.message, 'bad'); }
-    });
-  } else if (S.active === 'payroll') {
-    q('#prevMonth', S.root)?.addEventListener('click', () => { S.month = shiftMonth(S.month, -1); loadAndRender(); });
-    q('#nextMonth', S.root)?.addEventListener('click', () => { S.month = shiftMonth(S.month, 1); loadAndRender(); });
-    on(S.root, 'click', '[data-finalize]', async (e, b) => {
-      const empId = +b.dataset.finalize;
-      const emp = S.employees.find(x => x.id === empId);
-      const yes = await confirm('Finalize payroll?',
-        `This locks in ${emp?.name || 'this employee'}'s pay for ${monthLabel(S.month)} and settles their pending advances against it. You can still mark it paid afterwards.`);
-      if (!yes) return;
-      try { await api.finalize_payroll(empId, S.month); toast('Payroll finalized', '', 'ok'); await loadAndRender(); }
-      catch (err) { toast('Could not finalize', err.message, 'bad'); }
-    });
-    on(S.root, 'click', '[data-payid]', async (e, b) => {
-      try { await api.mark_payroll_paid(+b.dataset.payid); await loadAndRender(); }
-      catch (err) { toast('Could not update', err.message, 'bad'); }
-    });
-  }
-}

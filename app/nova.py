@@ -211,10 +211,16 @@ def main():
     shop_name = database.get_setting("store_name", "")
     title = brand.window_title(shop_name)
 
+    # maximized: the shop runs this on a full-size monitor all day and
+    # expects it to fill the screen the moment it opens, the way the old
+    # app did - not a 1360x860 window sitting in the middle that has to
+    # be dragged bigger on every start. The width/height stay as the
+    # restore-down size for when the window IS un-maximised.
     window_kwargs = dict(
         js_api=api,
         width=1360, height=860,
         min_size=(1100, 680),
+        maximized=True,
     )
     icon_path = next((p for p in (resource_path("assets", "icon.ico"),
                                   resource_path("web", "icon.ico"),
@@ -226,11 +232,21 @@ def main():
         # cosmetic, so a failure here must never stop the window opening.
         window_kwargs["icon"] = icon_path
 
-    try:
-        window = webview.create_window(title, _web_index(), **window_kwargs)
-    except TypeError:
-        window_kwargs.pop("icon", None)
-        window = webview.create_window(title, _web_index(), **window_kwargs)
+    # Older pywebview builds accept neither `icon=` nor `maximized=`, and
+    # both are cosmetic - drop them one at a time rather than letting an
+    # unknown keyword stop the window opening at all.
+    window = None
+    for drop in ((), ("icon",), ("icon", "maximized")):
+        kwargs = {k: v for k, v in window_kwargs.items() if k not in drop}
+        try:
+            window = webview.create_window(title, _web_index(), **kwargs)
+            break
+        except TypeError:
+            continue
+    if window is None:
+        _fatal("The window could not be created.",
+               "This build of the window component did not accept the window settings.")
+        return
 
     try:
         # http_server=True matters more than it looks: the UI is built from
