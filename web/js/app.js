@@ -16,11 +16,11 @@ const NAV = [
     { id: 'dashboard', label: 'Dashboard', icon: 'dashboard' },
   ]},
   { group: 'Billing', items: [
-    { id: 'newbill', label: 'New Bill', icon: 'plusCircle' },
+    { id: 'newbill', label: 'New Bill', icon: 'plusCircle', liveOnly: true },
     { id: 'history', label: 'Bill History', icon: 'book' },
-    { id: 'pdfs', label: 'Bill PDFs', icon: 'file' },
   ]},
   { group: 'Money', items: [
+    { id: 'earnings', label: 'Earnings', icon: 'chart', needsPerm: 'view_profit' },
     { id: 'khata', label: 'Khata / Ledger', icon: 'rupee', needs: 'khata' },
   ]},
   { group: 'Catalogue', items: [
@@ -30,7 +30,7 @@ const NAV = [
   { group: 'People', items: [
     { id: 'customers', label: 'Customers', icon: 'users' },
     { id: 'insights', label: 'Customer Insights', icon: 'chart' },
-    { id: 'attendance', label: 'Attendance', icon: 'calendar', needsPerm: 'manage_attendance' },
+    { id: 'attendance', label: 'Attendance', icon: 'calendar', needsPerm: 'manage_attendance', liveOnly: true },
   ]},
 ];
 
@@ -38,7 +38,7 @@ const VIEWS = {
   dashboard: () => import('./views/dashboard.js'),
   newbill:   () => import('./views/newbill.js'),
   history:   () => import('./views/history.js'),
-  pdfs:      () => import('./views/pdfs.js'),
+  earnings:  () => import('./views/earnings.js'),
   khata:     () => import('./views/khata.js'),
   inventory: () => import('./views/inventory.js'),
   stock:     () => import('./views/stock.js'),
@@ -81,6 +81,7 @@ async function boot() {
   }
 
   app.settings = info?.settings || { store_name: 'Balaji Store' };
+  app.archive = info?.archive || null;      // opened from an archive file
   app.user = info?.user || null;
   app.flags = { stock: !!info?.track_stock, khata: !!info?.track_khata };
   app.can = info?.can || {};       // what security.py says this user may do
@@ -364,6 +365,11 @@ function render() {
     </aside>
 
     <main class="main">
+      ${app.archive ? `<div class="archive-band">
+        ${icon('history', 15)}
+        <span class="grow">You are looking at an <b>archive</b> — ${esc(app.archive.name)}.
+          This is a saved copy of past trading and nothing in it can be changed.</span>
+      </div>` : ''}
       <header class="topbar">
         <button class="btn btn-ghost btn-icon btn-sm" id="railToggle" title="Collapse sidebar (Ctrl+B)">
           ${icon('grip', 16)}
@@ -401,7 +407,12 @@ function paintNav() {
   nav.innerHTML = NAV.map(sec => {
     const items = sec.items.filter(it =>
       (!it.needs || app.flags[it.needs] !== false) &&
-      (!it.needsPerm || app.can[it.needsPerm] === true));
+      (!it.needsPerm || app.can[it.needsPerm] === true) &&
+      // An archive is for reading. Writing a bill into a snapshot of last
+      // Tuesday, or marking attendance in it, is not a thing anyone means
+      // to do - the backend refuses either way, but offering it and then
+      // refusing is a worse screen than not offering it.
+      !(app.archive && it.liveOnly));
     if (!items.length) return '';
     return (sec.group ? `<div class="nav-group">${esc(sec.group)}</div>` : '<div style="height:6px"></div>')
       + items.map(it => `

@@ -10,7 +10,7 @@
 ; ============================================================
 
 #define AppName        "Vikray"
-#define AppVersion     "3.0.4"
+#define AppVersion     "3.0.5"
 #define AppPublisher   "Vikray Retail Software"
 #define AppExeName     "Vikray.exe"
 #define SrcDir         "..\dist\Vikray"
@@ -56,6 +56,16 @@ Name: "{group}\{#AppName}";              Filename: "{app}\{#AppExeName}"
 Name: "{group}\Uninstall {#AppName}";    Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}";        Filename: "{app}\{#AppExeName}"; Tasks: desktopicon
 Name: "{userstartup}\{#AppName}";        Filename: "{app}\{#AppExeName}"; Tasks: startup
+
+[Registry]
+; Double-clicking a .bbak archive opens it in Vikray, read-only - see
+; nova.py's _open_as_archive(). Registered per-user (HKCU) to match this
+; installer's non-admin, per-user install; Explorer honours it the same
+; way and uninstalling takes it back out again.
+Root: HKCU; Subkey: "Software\Classes\.bbak"; ValueType: string; ValueName: ""; ValueData: "Vikray.Archive"; Flags: uninsdeletevalue
+Root: HKCU; Subkey: "Software\Classes\Vikray.Archive"; ValueType: string; ValueName: ""; ValueData: "Vikray archived bills"; Flags: uninsdeletekey
+Root: HKCU; Subkey: "Software\Classes\Vikray.Archive\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\{#AppExeName},0"
+Root: HKCU; Subkey: "Software\Classes\Vikray.Archive\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExeName}"" ""%1"""
 
 [Run]
 Filename: "{app}\{#AppExeName}"; Description: "Open {#AppName} now"; Flags: nowait postinstall skipifsilent

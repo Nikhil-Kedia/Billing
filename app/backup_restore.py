@@ -539,6 +539,260 @@ def delete_archived_bills(date_from, date_to):
     return len(rows)
 
 
+# ---------------- DAY ARCHIVE ----------------
+#
+# WHAT THIS IS FOR
+#
+# A shop that writes a hundred bills a day does not want five years of
+# them in the live file forever - it wants the day's trade taken off to
+# a pendrive and out of the working set, and it wants to be able to LOOK
+# at that pendrive later without any of it coming back.
+#
+# Three rules shape everything below.
+#
+#   1. The archive must stand on its own. Not just the bills: the
+#      customers they belong to, the items they mention, and the shop's
+#      own name and settings, so that opening it shows the app as it was
+#      rather than a table of orphaned rows. See _ARCHIVE_TABLES.
+#
+#   2. Nothing is deleted until the archive has been re-opened and
+#      counted. verify_archive() reads the file back from disk after
+#      writing it; archive_and_purge() will not remove a single bill
+#      unless the file it just wrote actually contains them. A pendrive
+#      that was pulled out half way through must cost the shop nothing.
+#
+#   3. Removing the bills must not touch stock. This is the one that
+#      would be silent and expensive if it were wrong. The stock on the
+#      shelf is the result of those sales having happened; forgetting the
+#      paperwork does not put the goods back. purge_archived_bills()
+#      therefore deletes bills, their lines and their ledger entries and
+#      NOTHING else - it never calls the restock path that delete_bill()
+#      uses, and it deliberately leaves the cost layers exactly as they
+#      are. See its own comment for what it does to the cost bookkeeping
+#      and why.
+
+# Everything an archive carries, in the order it has to be written:
+# parents before the rows that point at them.
+_ARCHIVE_TABLES = ["customers", "items", "cost_lots", "bills", "bill_items",
+                   "customer_ledger", "settings"]
+
+# Settings that describe the SHOP (so the archive opens looking like
+# itself) rather than the machine or the security setup. Nothing about
+# authentication travels in an archive - see PROTECTED_SETTINGS for the
+# same reasoning applied to imports.
+_ARCHIVE_SETTINGS = (
+    "store_name", "store_address", "store_contact", "store_gstin", "show_gstin",
+    "bill_prefix", "track_stock", "track_khata", "currency_symbol", "logo_path",
+)
+
+
+def archive_filename(date_from, date_to):
+    """One file per day, named so that a folder of them sorts by date and
+    reads as a list of days rather than a pile of timestamps."""
+    if date_from == date_to:
+        return f"vikray-archive-{date_from}.bbak"
+    return f"vikray-archive-{date_from}_to_{date_to}.bbak"
+
+
+def export_day_archive(dest_path, date_from, date_to):
+    """Writes (or adds to) a self-contained archive for a date range.
+
+    APPEND-ONLY, like the rest of this module's archive path: pointing
+    two days at the same file adds the second day rather than replacing
+    the first, and re-running a day that is already in there adds
+    nothing. That is what makes "just archive again" a safe answer to
+    almost any doubt.
+
+    Returns a summary dict.
+    """
+    live = db.get_connection()
+    out = _open_or_create_archive_conn(dest_path, _ARCHIVE_TABLES)
+    try:
+        rows = live.execute(
+            "SELECT * FROM bills WHERE bill_date >= ? AND bill_date <= ? ORDER BY id",
+            (date_from, date_to)).fetchall()
+
+        bill_ids, number_overrides, skipped = [], {}, 0
+        for r in rows:
+            existing = out.execute("SELECT * FROM bills WHERE bill_number = ?",
+                                    (r["bill_number"],)).fetchone()
+            if existing and _looks_like_same_bill(existing, r):
+                skipped += 1                      # already safely in this file
+                continue
+
+            archive_number = r["bill_number"]
+            notes = r["notes"] or ""
+            if existing:
+                # Same number, different bill - the live counter was reset
+                # at some point. Both are real; keep both.
+                archive_number = f"{r['bill_number']}-DUP{r['id']}"
+                number_overrides[r["bill_number"]] = archive_number
+                notes = (notes + f" [Archived as {archive_number} - bill number {r['bill_number']} "
+                                  f"was already used by a different bill in this archive]").strip()
+
+            cols = r.keys()
+            values = [archive_number if c == "bill_number" else (notes if c == "notes" else r[c])
+                      for c in cols]
+            out.execute(f"INSERT INTO bills ({','.join(cols)}) VALUES ({','.join('?' * len(cols))})",
+                        tuple(values))
+            bill_ids.append(r["id"])
+
+        _copy_bill_items(live, out, bill_ids)
+        _copy_ledger_for_bills(live, out, bill_ids, number_overrides)
+
+        # The context that makes the archive readable on its own. Copied
+        # wholesale and idempotently rather than only the rows these bills
+        # reference: an archive is opened to browse, and a customer with no
+        # bills in it costs a few hundred bytes while a missing one turns a
+        # customer screen into a puzzle.
+        _replace_all(live, out, "customers")
+        _replace_all(live, out, "items")
+        _replace_all(live, out, "cost_lots")
+        _copy_settings(live, out)
+
+        out.commit()
+    finally:
+        out.close()
+        live.close()
+
+    return {"archived": len(bill_ids), "already_present": skipped,
+            "renumbered": len(number_overrides), "path": dest_path}
+
+
+def _replace_all(live, out, table):
+    """Mirrors a whole reference table into the archive, replacing what
+    was there. Re-archiving a later day should carry the CURRENT customer
+    list and item list, not the one from whenever the file was started."""
+    out.execute(f"DELETE FROM {table}")
+    _copy_all(live, out, table)
+
+
+def _copy_settings(live, out):
+    out.execute("DELETE FROM settings")
+    for key in _ARCHIVE_SETTINGS:
+        row = live.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        if row is not None:
+            out.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)",
+                        (key, row["value"]))
+    # A marker so the app can tell an archive from an ordinary backup the
+    # moment it opens one, and say so on screen.
+    out.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('archive_marker', ?)",
+                (db.now_str(),))
+
+
+def verify_archive(path, date_from, date_to, expected_numbers):
+    """Re-opens the file that was just written and checks the bills are
+    really in it. This is the gate the delete step has to pass: read from
+    disk, not from the handle that wrote it, so a failed flush or a
+    pendrive yanked mid-write is caught here rather than after the live
+    rows are gone.
+
+    Returns (ok, message).
+    """
+    if not os.path.isfile(path):
+        return False, "The archive file was not created."
+    try:
+        conn = _read_only_conn(path)
+    except sqlite3.Error as e:
+        return False, f"The archive could not be re-opened: {e}"
+    try:
+        if not _table_exists(conn, "bills"):
+            return False, "The archive has no bills table."
+        found = set()
+        for r in conn.execute("SELECT bill_number FROM bills").fetchall():
+            n = r["bill_number"] or ""
+            found.add(n.split("-DUP")[0])          # renumbered duplicates still count
+        missing = [n for n in expected_numbers if n not in found]
+        if missing:
+            head = ", ".join(missing[:5])
+            more = f" and {len(missing) - 5} more" if len(missing) > 5 else ""
+            return False, f"{len(missing)} bill(s) did not make it into the archive: {head}{more}."
+        # Line items too - a bills table with no lines under it is not a
+        # readable record of anything.
+        if expected_numbers and _table_exists(conn, "bill_items"):
+            n_lines = conn.execute("SELECT COUNT(*) AS n FROM bill_items").fetchone()["n"]
+            if not n_lines:
+                return False, "The archive contains bills but none of their items."
+    finally:
+        conn.close()
+    return True, ""
+
+
+def purge_archived_bills(date_from, date_to):
+    """Removes archived bills from the LIVE database. Stock is untouched.
+
+    A sale that happened, happened: the goods left the shop, and taking
+    the paperwork off to a pendrive does not bring them back. So unlike
+    delete_bill(), nothing here adds quantities back, and nothing releases
+    the cost layers those sales consumed.
+
+    The cost bookkeeping is tidied rather than reversed:
+      - cost_consumption rows for these bills are deleted. They exist only
+        to undo a LIVE bill edit, which these bills can no longer have;
+        the cost they recorded is already frozen on bill_items.cost_at_sale
+        and has travelled into the archive with it.
+      - cost_lots created by an archived PURCHASE bill keep every unit of
+        their remaining stock and simply lose the bill_id pointing at the
+        bill that no longer exists. The stock is real and still on the
+        shelf; only its paperwork has moved.
+
+    Returns the number of bills removed.
+    """
+    conn = db.get_connection()
+    cur = conn.cursor()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        rows = cur.execute(
+            "SELECT id, bill_number FROM bills WHERE bill_date >= ? AND bill_date <= ?",
+            (date_from, date_to)).fetchall()
+        ids = [r["id"] for r in rows]
+        if ids:
+            marks = ",".join("?" * len(ids))
+            cur.execute(f"DELETE FROM cost_consumption WHERE bill_id IN ({marks})", ids)
+            cur.execute(f"UPDATE cost_lots SET bill_id = NULL WHERE bill_id IN ({marks})", ids)
+            for r in rows:
+                cur.execute("DELETE FROM customer_ledger WHERE reference = ? OR reference = ?",
+                            (r["bill_number"], f"Payment for {r['bill_number']}"))
+            cur.execute(f"DELETE FROM bill_items WHERE bill_id IN ({marks})", ids)
+            cur.execute(f"DELETE FROM bills WHERE id IN ({marks})", ids)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    db.bump("bills", "customers")
+    return len(ids)
+
+
+def archive_and_purge(dest_path, date_from, date_to, purge=True):
+    """The whole operation, in the only order that is safe: write, read
+    back, count, and only then remove.
+
+    Returns a summary dict; `purged` is 0 whenever anything about the
+    verification did not add up, and `error` says why.
+    """
+    live = db.get_connection()
+    expected = [r["bill_number"] for r in live.execute(
+        "SELECT bill_number FROM bills WHERE bill_date >= ? AND bill_date <= ?",
+        (date_from, date_to)).fetchall()]
+    live.close()
+
+    if not expected:
+        return {"archived": 0, "already_present": 0, "renumbered": 0, "purged": 0,
+                "path": dest_path, "error": "", "nothing_to_do": True}
+
+    summary = export_day_archive(dest_path, date_from, date_to)
+    ok, message = verify_archive(dest_path, date_from, date_to, expected)
+    summary["verified"] = ok
+    summary["error"] = "" if ok else message
+    summary["purged"] = 0
+    summary["nothing_to_do"] = False
+    if ok and purge:
+        summary["purged"] = purge_archived_bills(date_from, date_to)
+    return summary
+
+
 # ---------------- IMPORT / MERGE ----------------
 
 class Conflict:

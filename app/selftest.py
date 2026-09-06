@@ -13,6 +13,7 @@ bridge, not a one-off script.
 import os
 import shutil
 import sys
+import sqlite3
 import tempfile
 import types
 
@@ -176,8 +177,6 @@ check("audit_log", ok and isinstance(data, list), data if not ok else f"{len(dat
 ok, data = call(api, "data_dir")
 check("data_dir", ok and isinstance(data, str) and os.path.isdir(data), data)
 
-ok, data = call(api, "pdf_list")
-check("pdf_list", ok and isinstance(data, list), data if not ok else f"{len(data)} bills listed")
 
 ok, data = call(api, "open_folder", "data")
 check("open_folder", ok, data if not ok else "")
@@ -432,6 +431,109 @@ if ok:
     check("import_items: re-importing an unmodified export adds nothing new",
           ok and data.get("added", -1) == 0, data)
 
+
+# ---------------------------------------------------------------------
+# Earnings - the profit workspace. Checks the arithmetic hangs together
+# rather than just that the calls return: a drill-down whose parts do not
+# add up to their own headline is the failure that would actually matter.
+# ---------------------------------------------------------------------
+ok, earn = call(api, "earnings", "all")
+check("earnings", ok and "summary" in earn and "items" in earn,
+      earn if not ok else f"{len(earn.get('items', []))} items, {len(earn.get('daily', []))} days")
+
+if ok:
+    s = earn["summary"]
+    check("earnings: revenue - cost == profit",
+          abs((s["revenue"] - s["cost"]) - s["profit"]) < 0.05,
+          f"{s['revenue']} - {s['cost']} != {s['profit']}")
+    item_profit = round(sum(r["profit"] for r in earn["items"]), 2)
+    check("earnings: profit by item adds up to the total",
+          abs(item_profit - s["profit"]) < 0.05,
+          f"items {item_profit} vs total {s['profit']}")
+    cust_profit = round(sum(r["profit"] for r in earn["customers"]), 2)
+    check("earnings: profit by customer adds up to the total",
+          abs(cust_profit - s["profit"]) < 0.05,
+          f"customers {cust_profit} vs total {s['profit']}")
+
+ok, drill = call(api, "earnings_bills", "all")
+check("earnings_bills", ok and isinstance(drill.get("bills"), list),
+      drill if not ok else f"{len(drill['bills'])} bills")
+
+if ok and drill["bills"]:
+    first = drill["bills"][0]
+    ok2, detail = call(api, "bill_profit", first["bill_id"])
+    check("bill_profit", ok2 and "lines" in detail,
+          detail if not ok2 else f"{len(detail['lines'])} lines")
+    if ok2:
+        line_profit = round(sum(l["line_profit"] for l in detail["lines"]), 2)
+        check("bill_profit: lines add up to the bill's profit",
+              abs(line_profit - detail["profit"]) < 0.05,
+              f"lines {line_profit} vs bill {detail['profit']}")
+        check("bill_profit: every line says where its cost came from",
+              all(l.get("cost_source") in ("recorded", "default", "none") for l in detail["lines"]))
+
+ok, checks = call(api, "earnings_checks", "all")
+check("earnings_checks", ok and all(k in checks for k in
+      ("sold_below_cost", "no_cost", "free", "suspicious_margin")), checks if not ok else "")
+
+# ---------------------------------------------------------------------
+# Archiving - the one operation that deletes real trading records. The
+# check that matters is that stock survives it.
+# ---------------------------------------------------------------------
+ok, arc = call(api, "archive_settings")
+check("archive_settings", ok and "folder" in arc, arc if not ok else "")
+
+_arc_dir = os.path.join(tempfile.gettempdir(), "vikray_selftest_archive")
+os.makedirs(_arc_dir, exist_ok=True)
+db.set_setting("archive_dir", _arc_dir)
+
+_bills_before = db.get_all_bills()
+if _bills_before:
+    _day = _bills_before[0]["bill_date"]
+    _stock_before = {i["id"]: i["quantity"] for i in db.get_all_items()}
+
+    ok, prev = call(api, "archive_preview", _day, _day)
+    check("archive_preview", ok and prev.get("bills", 0) > 0,
+          prev if not ok else f"{prev['bills']} bills on {_day}")
+
+    ok, res = call(api, "archive_run", _day, _day, "append", True)
+    check("archive_run", ok and res.get("verified") and res.get("archived", 0) > 0,
+          res if not ok else f"{res['archived']} archived, {res['purged']} removed")
+
+    if ok:
+        check("archive: the file is really there",
+              os.path.isfile(res["path"]),
+              res["path"])
+        check("archive: those bills are gone from the app",
+              not [b for b in db.get_all_bills() if b["bill_date"] == _day])
+        _stock_after = {i["id"]: i["quantity"] for i in db.get_all_items()}
+        drifted = [k for k in _stock_before
+                   if abs(_stock_before[k] - _stock_after.get(k, 0)) > 1e-9]
+        check("archive: STOCK IS UNCHANGED (what was sold stays sold)",
+              not drifted,
+              f"{len(drifted)} item(s) moved: {drifted[:5]}")
+
+        # The archive has to stand on its own, or it is not an archive.
+        _ac = sqlite3.connect(res["path"])
+        _ac.row_factory = sqlite3.Row
+        _have = {r["name"] for r in _ac.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        check("archive: is self-contained",
+              {"bills", "bill_items", "customers", "items", "settings"} <= _have,
+              f"has {sorted(_have)}")
+        _n = _ac.execute("SELECT COUNT(*) n FROM bills").fetchone()["n"]
+        check("archive: holds the bills", _n >= res["archived"], f"{_n} bills inside")
+        _shop = _ac.execute("SELECT value FROM settings WHERE key='store_name'").fetchone()
+        check("archive: carries the shop's own name", _shop is not None,
+              _shop["value"] if _shop else "missing")
+        _ac.close()
+
+    ok, res2 = call(api, "archive_run", _day, _day, "append", True)
+    check("archive: re-archiving an emptied day is refused, not repeated", not ok,
+          "allowed a second run" if ok else "")
+
+db.set_setting("archive_dir", "")
+shutil.rmtree(_arc_dir, ignore_errors=True)
 
 # ---------------------------------------------------------------------
 # Summary

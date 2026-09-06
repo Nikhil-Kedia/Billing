@@ -61,7 +61,7 @@ All are `await api.method(args)` and throw on failure. Available (see mock.js fo
 `bootstrap, quick_search, dashboard(range), items_snapshot, customers_snapshot, customer_balance(id),
 next_bill_number, stock_levels(ids), create_bill(payload), update_bill(payload), get_bills(search, from, to),
 get_bill(id), delete_bill(id, restock), open_pdf(billId), print_bill(billId), send_whatsapp(billId, phone),
-pdf_list(), get_items(search), add_item(obj), update_item(id, obj), delete_item(id),
+get_items(search), add_item(obj), update_item(id, obj), delete_item(id),
 adjust_stock(id, delta, type, notes), inventory_transactions(search), clear_inventory_transactions(),
 get_customers(search), add_customer(obj), update_customer(id, obj), delete_customer(id),
 customers_with_dues(), customer_ledger(id), add_ledger_payment(id, amount, notes),

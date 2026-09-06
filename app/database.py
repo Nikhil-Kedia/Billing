@@ -7,6 +7,7 @@ Single-file database stored at data/balaji_billing.db
 import sqlite3
 import os
 import calendar
+from urllib.request import pathname2url
 from datetime import datetime
 import appdata
 
@@ -16,7 +17,49 @@ DB_DIR = appdata.data_dir()
 DB_PATH = os.path.join(DB_DIR, "balaji_billing.db")
 
 
+# ---------------- ARCHIVE VIEWING MODE ----------------
+#
+# When an archive file is double-clicked, the whole app opens against a
+# COPY of it instead of the shop's live data (see nova.py). The copy is
+# migrated once so every screen finds the tables it expects, and then
+# this flag is set - from that point every connection is opened
+# ?mode=ro, and SQLite itself refuses to write.
+#
+# The refusal lives here, at the one place that hands out connections,
+# rather than in a list of "methods that must be blocked" somewhere
+# above. A list has to be kept up to date with every feature added
+# afterwards, and would be wrong the first time someone forgot; a
+# read-only file handle cannot be forgotten.
+_read_only = False
+_archive_path = ""
+
+
+def open_archive(db_path, source_path=""):
+    """Points the whole app at an archive copy and locks it read-only."""
+    global DB_DIR, DB_PATH, _read_only, _archive_path
+    DB_PATH = db_path
+    DB_DIR = os.path.dirname(db_path) or DB_DIR
+    _archive_path = source_path or db_path
+    _read_only = True
+    _cache.clear()
+
+
+def is_read_only():
+    return _read_only
+
+
+def archive_source_path():
+    return _archive_path
+
+
 def get_connection():
+    if _read_only:
+        # pathname2url so spaces, '?' and '#' in a filename on a pendrive
+        # cannot change what the URI means.
+        uri = "file:" + pathname2url(os.path.abspath(DB_PATH)) + "?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=15)
+        conn.row_factory = sqlite3.Row
+        return conn
     os.makedirs(DB_DIR, exist_ok=True)
     # timeout= is how many seconds SQLite will keep silently retrying
     # before raising "database is locked" - Python's own default (5s) is
@@ -2423,6 +2466,281 @@ def get_daily_profit(date_from=None, date_to=None):
     rows = conn.execute(query, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+# ==================================================================
+# EARNINGS  (owner-only - see security.PERM_VIEW_PROFIT)
+#
+# One question asked six ways: where did the profit come from, and is
+# any of it wrong?
+#
+# Every figure below is built from the SAME two expressions -
+# SQL_LINE_COST and SQL_LINE_PROFIT - so a total and the rows that make
+# it up can never disagree. That matters more here than anywhere else in
+# the app: the whole point of this screen is to be able to click a
+# number and arrive at the transactions behind it, and a drill-down that
+# does not add up to its own headline is worse than no drill-down.
+#
+# Sale lines only. A purchase line's price_per_unit is what was PAID,
+# not charged, so counting it as revenue (or profit) would be nonsense -
+# the same rule the dashboard has always followed.
+# ==================================================================
+
+_EARN_SELECT = f"""
+    COALESCE(SUM(bi.price_per_unit * bi.quantity), 0) AS revenue,
+    COALESCE(SUM({SQL_LINE_COST}), 0)                 AS cost,
+    COALESCE(SUM({SQL_LINE_PROFIT}), 0)               AS profit
+"""
+
+_EARN_FROM = """
+    FROM bill_items bi
+    JOIN bills b ON b.id = bi.bill_id
+    LEFT JOIN items i ON i.id = bi.item_id
+    WHERE b.bill_type = 'sale'
+"""
+
+
+def _margin(revenue, profit):
+    """Profit as a percentage of revenue. Guards the empty case rather
+    than returning a division error dressed up as a number."""
+    try:
+        return round(profit / revenue * 100, 2) if revenue else 0.0
+    except (TypeError, ZeroDivisionError):
+        return 0.0
+
+
+def _with_margin(row):
+    d = dict(row)
+    d["margin"] = _margin(d.get("revenue") or 0, d.get("profit") or 0)
+    return d
+
+
+def earnings_summary(date_from=None, date_to=None):
+    """The headline: revenue, what it cost, what was left, and how much
+    of the trade the app can actually vouch for."""
+    conn = get_connection()
+    q = f"SELECT {_EARN_SELECT}, COUNT(DISTINCT b.id) AS bills, COUNT(bi.id) AS lines {_EARN_FROM}"
+    q, params = _date_window(q, [], date_from, date_to, "b.bill_date")
+    row = _with_margin(conn.execute(q, params).fetchone())
+
+    # How much of this was costed from a real recorded cost, rather than
+    # falling back to the item's current default. Quoted on the screen
+    # because a profit figure resting mostly on assumptions deserves to
+    # say so out loud.
+    q2 = f"""SELECT COALESCE(SUM(CASE WHEN bi.cost_at_sale IS NOT NULL
+                                      THEN bi.price_per_unit * bi.quantity ELSE 0 END), 0) AS costed_revenue,
+                    COUNT(CASE WHEN bi.cost_at_sale IS NULL THEN 1 END) AS uncosted_lines
+             {_EARN_FROM}"""
+    q2, p2 = _date_window(q2, [], date_from, date_to, "b.bill_date")
+    extra = dict(conn.execute(q2, p2).fetchone())
+    conn.close()
+    row.update(extra)
+    row["costed_pct"] = _margin(row.get("revenue") or 0, extra.get("costed_revenue") or 0)
+    return row
+
+
+def earnings_daily(date_from=None, date_to=None):
+    """Revenue, cost and profit per day - the trend chart's data."""
+    conn = get_connection()
+    q = f"SELECT b.bill_date AS date, {_EARN_SELECT} {_EARN_FROM}"
+    q, params = _date_window(q, [], date_from, date_to, "b.bill_date")
+    q += " GROUP BY b.bill_date ORDER BY b.bill_date"
+    rows = [_with_margin(r) for r in conn.execute(q, params).fetchall()]
+    conn.close()
+    return rows
+
+
+def earnings_by_item(date_from=None, date_to=None, limit=200):
+    """Profit per product. Grouped by the NAME stored on the bill line,
+    not by item id: a line whose item was later deleted still sold and
+    still earned, and dropping it would quietly make the parts add up to
+    less than the whole."""
+    conn = get_connection()
+    q = f"""SELECT bi.item_name AS label, MAX(bi.item_id) AS item_id,
+                   COALESCE(SUM(bi.quantity), 0) AS quantity,
+                   COUNT(DISTINCT b.id) AS bills,
+                   COUNT(CASE WHEN bi.cost_at_sale IS NULL THEN 1 END) AS uncosted_lines,
+                   {_EARN_SELECT}
+            {_EARN_FROM}"""
+    q, params = _date_window(q, [], date_from, date_to, "b.bill_date")
+    q += " GROUP BY bi.item_name ORDER BY profit DESC LIMIT ?"
+    rows = [_with_margin(r) for r in conn.execute(q, params + [int(limit)]).fetchall()]
+    conn.close()
+    return rows
+
+
+def earnings_by_customer(date_from=None, date_to=None, limit=200):
+    """Profit per customer. Grouped by the name on the bill for the same
+    reason as items - a deleted customer's bills still happened."""
+    conn = get_connection()
+    q = f"""SELECT b.customer_name AS label, MAX(b.customer_id) AS customer_id,
+                   COUNT(DISTINCT b.id) AS bills,
+                   {_EARN_SELECT}
+            {_EARN_FROM}"""
+    q, params = _date_window(q, [], date_from, date_to, "b.bill_date")
+    q += " GROUP BY b.customer_name ORDER BY profit DESC LIMIT ?"
+    rows = [_with_margin(r) for r in conn.execute(q, params + [int(limit)]).fetchall()]
+    conn.close()
+    return rows
+
+
+def earnings_by_category(date_from=None, date_to=None, limit=100):
+    conn = get_connection()
+    q = f"""SELECT COALESCE(NULLIF(i.category, ''), 'Uncategorised') AS label,
+                   COUNT(DISTINCT b.id) AS bills,
+                   {_EARN_SELECT}
+            {_EARN_FROM}"""
+    q, params = _date_window(q, [], date_from, date_to, "b.bill_date")
+    q += " GROUP BY label ORDER BY profit DESC LIMIT ?"
+    rows = [_with_margin(r) for r in conn.execute(q, params + [int(limit)]).fetchall()]
+    conn.close()
+    return rows
+
+
+def earnings_by_bill(date_from=None, date_to=None, limit=500, item_name=None, customer_name=None):
+    """Profit per bill - and, with item_name or customer_name set, the
+    drill-down: the bills behind one row of the lists above.
+
+    When drilling into an ITEM the figures are that item's contribution
+    to each bill, not the whole bill, because that is the number the row
+    above was made of. `bill_revenue`/`bill_profit` carry the whole bill
+    alongside it, so the screen can show both without a second query.
+    """
+    conn = get_connection()
+    q = f"""SELECT b.id AS bill_id, b.bill_number, b.bill_date, b.bill_time,
+                   b.customer_name, b.total AS bill_total,
+                   COUNT(bi.id) AS lines,
+                   COUNT(CASE WHEN bi.cost_at_sale IS NULL THEN 1 END) AS uncosted_lines,
+                   {_EARN_SELECT}
+            {_EARN_FROM}"""
+    params = []
+    if item_name:
+        q += " AND bi.item_name = ?"
+        params.append(item_name)
+    if customer_name:
+        q += " AND b.customer_name = ?"
+        params.append(customer_name)
+    q, params = _date_window(q, params, date_from, date_to, "b.bill_date")
+    q += " GROUP BY b.id ORDER BY b.bill_date DESC, b.id DESC LIMIT ?"
+    rows = [_with_margin(r) for r in conn.execute(q, params + [int(limit)]).fetchall()]
+    conn.close()
+    return rows
+
+
+def bill_profit_detail(bill_id):
+    """One bill, line by line, with the cost that was ACTUALLY used to
+    work out its profit.
+
+    This is the audit view: the cost shown is `cost_at_sale / quantity` -
+    what the batches this line consumed really cost at the moment it was
+    sold - and NOT the item's cost price as it stands today. Those two
+    drift apart the moment stock is bought at a new price, which is
+    exactly when a wrong-looking profit needs explaining.
+
+    `cost_source` says where each line's cost came from:
+        recorded - the cost layers it consumed (trustworthy)
+        default  - the item's cost price, because the line predates cost
+                   layers (an estimate, and dated)
+        none     - no cost is known at all, so the profit is the full
+                   selling price and is certainly overstated
+    """
+    bill = get_bill(bill_id)
+    if not bill:
+        return None
+    conn = get_connection()
+    rows = conn.execute("""
+        SELECT bi.*, i.category AS category, i.unit AS item_unit,
+               i.cost_price AS current_default_cost
+        FROM bill_items bi
+        LEFT JOIN items i ON i.id = bi.item_id
+        WHERE bi.bill_id = ? ORDER BY bi.id
+    """, (bill_id,)).fetchall()
+    conn.close()
+
+    is_sale = (bill.get("bill_type") or "sale") == "sale"
+    lines, revenue, cost = [], 0.0, 0.0
+    for r in rows:
+        d = dict(r)
+        qty = d.get("quantity") or 0
+        line_revenue = (d.get("price_per_unit") or 0) * qty
+
+        if d.get("cost_at_sale") is not None:
+            line_cost = d["cost_at_sale"]
+            source = "recorded"
+        elif (d.get("current_default_cost") or 0) > 0:
+            line_cost = (d["current_default_cost"] or 0) * qty
+            source = "default"
+        else:
+            line_cost = 0.0
+            source = "none"
+
+        d["line_revenue"] = round(line_revenue, 2)
+        d["line_cost"] = round(line_cost, 2)
+        d["cost_per_unit"] = round(line_cost / qty, 4) if qty else 0.0
+        d["line_profit"] = round(line_revenue - line_cost, 2)
+        d["margin"] = _margin(line_revenue, d["line_profit"])
+        d["cost_source"] = source
+        lines.append(d)
+        revenue += line_revenue
+        cost += line_cost
+
+    return {
+        "bill": bill,
+        "lines": lines,
+        "is_sale": is_sale,
+        "revenue": round(revenue, 2),
+        "cost": round(cost, 2),
+        "profit": round(revenue - cost, 2),
+        "margin": _margin(revenue, revenue - cost),
+    }
+
+
+def earnings_checks(date_from=None, date_to=None, limit=60):
+    """Lines worth a second look - the "is any of this wrong?" half of
+    the screen.
+
+    None of these is automatically an error. Each is a shape that is
+    usually a mistake in either the billing or the costing, and each is
+    something no total would ever reveal on its own:
+
+      sold_below_cost  - the line lost money. Sometimes deliberate (old
+                         stock, a favour); usually a price typed wrong or
+                         a cost recorded per carton against a per-piece
+                         quantity.
+      no_cost          - no cost is known, so the app is reporting the
+                         entire selling price as profit. Every one of
+                         these inflates the headline.
+      free             - sold at zero. Real often enough (a replacement,
+                         a sample) but it should be a decision, not a
+                         slip of the keyboard.
+      suspicious_margin - more than 90% margin on a costed line. Usually
+                         a cost that is out by a factor of ten.
+    """
+    conn = get_connection()
+    base = f"""SELECT b.id AS bill_id, b.bill_number, b.bill_date, b.customer_name,
+                      bi.item_name, bi.quantity, bi.price_per_unit,
+                      {SQL_LINE_COST} AS line_cost,
+                      bi.price_per_unit * bi.quantity AS line_revenue,
+                      {SQL_LINE_PROFIT} AS line_profit,
+                      bi.cost_at_sale AS cost_at_sale
+               {_EARN_FROM}"""
+
+    def run(extra_sql):
+        q, params = _date_window(base + extra_sql, [], date_from, date_to, "b.bill_date")
+        q += " ORDER BY b.bill_date DESC, b.id DESC LIMIT ?"
+        return [dict(r) for r in conn.execute(q, params + [int(limit)]).fetchall()]
+
+    out = {
+        "sold_below_cost": run(f" AND bi.price_per_unit > 0 AND {SQL_LINE_PROFIT} < -0.009"),
+        "no_cost": run(" AND bi.cost_at_sale IS NULL AND COALESCE(i.cost_price, 0) <= 0"
+                       " AND bi.price_per_unit > 0"),
+        "free": run(" AND bi.price_per_unit <= 0.009 AND bi.quantity > 0"),
+        "suspicious_margin": run(f" AND bi.cost_at_sale IS NOT NULL AND bi.cost_at_sale > 0"
+                                 f" AND bi.price_per_unit > 0"
+                                 f" AND {SQL_LINE_PROFIT} > 0.9 * (bi.price_per_unit * bi.quantity)"),
+    }
+    conn.close()
+    return out
 
 
 # ==================================================================

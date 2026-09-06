@@ -8,7 +8,7 @@
 import { api } from '../api.js';
 import * as Panels from '../panels.js';
 import {
-  q, qa, node, on, esc, icon, num, toast, modal, confirm, emptyState,
+  q, qa, node, on, esc, icon, num, inr, toast, modal, confirm, emptyState,
   debounce, dmy, hm12, prefs,
   setTheme, getTheme,
 } from '../core.js';
@@ -20,6 +20,7 @@ const SECTIONS = [
   { id: 'billing', label: 'Billing preferences',   icon: 'rupee' },
   { id: 'stock',   label: 'Stock & Khata',         icon: 'history' },
   { id: 'backup',  label: 'Backup & data',         icon: 'save' },
+  { id: 'archive', label: 'Archive a day',          icon: 'history' },
   { id: 'users',   label: 'Users & security',      icon: 'shield' },
   { id: 'about',   label: 'About',                 icon: 'info' },
 ];
@@ -93,6 +94,7 @@ async function reload() {
   }
   try { S.dataDir = await api.data_dir(); } catch { S.dataDir = S.dataDir || ''; }
   try { S.updateStatus = await api.get_update_status(); } catch { S.updateStatus = S.updateStatus || null; }
+  await refreshArchiveSettings();
   S.loading = false;
   renderSection();
 }
@@ -124,7 +126,7 @@ function renderSection() {
   const fn = {
     profile: sectionProfile, billing: sectionBilling, stock: sectionStock,
     appearance: sectionAppearance,
-    backup: sectionBackup, users: sectionUsers, about: sectionAbout,
+    backup: sectionBackup, archive: sectionArchive, users: sectionUsers, about: sectionAbout,
   }[S.active];
   host.innerHTML = fn ? fn() : '';
   wireSection();
@@ -774,6 +776,19 @@ function wireSection() {
     q('#openDataFolder', host)?.addEventListener('click', doOpenDataFolder);
     const keepEl = q('#keepDays', host);
     if (keepEl) keepEl.addEventListener('change', () => saveKeepDays(keepEl));
+  } else if (S.active === 'archive') {
+    q('#chooseArchiveFolder', host)?.addEventListener('click', doChooseArchiveFolder);
+    q('#openArchiveFolder', host)?.addEventListener('click',
+      () => api.open_archive_folder().catch(e => toast('Could not open it', e.message, 'bad')));
+    q('#archiveToday', host)?.addEventListener('click', () => {
+      const t = todayISO();
+      doArchive(t, t);
+    });
+    q('#archiveRange', host)?.addEventListener('click', () => {
+      const from = q('#arcFrom', host)?.value, to = q('#arcTo', host)?.value;
+      if (!from || !to) { toast('Pick the dates', 'Choose which days to archive.', 'bad'); return; }
+      doArchive(from > to ? to : from, from > to ? from : to);
+    });
   } else if (S.active === 'users') {
     q('#addUser', host)?.addEventListener('click', () => openUserModal(null));
     q('#viewAudit', host)?.addEventListener('click', openAuditLog);
@@ -797,5 +812,163 @@ function wireSection() {
     q('#openDataFolder2', host)?.addEventListener('click', doOpenDataFolder);
     q('#resetLayout', host)?.addEventListener('click', doResetLayout);
     q('#checkUpdates', host)?.addEventListener('click', doCheckUpdates);
+  }
+}
+
+/* ---------- archiving a day off to a pendrive ----------
+   Written as its own section because it is the only thing in this app
+   that deletes real trading records, and it deserves to look like it.
+   The confirmation says exactly how many bills, worth how much, to which
+   file - and states plainly that stock is not affected, because that is
+   the thing an owner would otherwise be right to worry about. */
+function sectionArchive() {
+  const owner = isOwner();
+  const a = S.archive || {};
+  const folder = a.folder || '';
+  const missing = folder && !a.exists;
+
+  return `
+    <div class="panel-head"><div class="h2 grow">Archive a day</div></div>
+    <div class="set-body col gap4">
+
+      <div class="set-row">
+        <div class="txt">
+          <div class="t">Where archives are saved</div>
+          <div class="d ${folder ? 'mono ellipsis' : ''}">${folder ? esc(folder) : 'Not chosen yet — pick a folder or a pendrive.'}</div>
+          ${missing ? `<div class="d" style="color:var(--warn-ink)">Not available right now. If it is a pendrive, plug it in.</div>` : ''}
+        </div>
+        <div class="row gap2">
+          ${folder ? `<button class="btn btn-ghost" id="openArchiveFolder">${icon('folder', 14)}Open</button>` : ''}
+          <button class="btn ${owner ? '' : 'is-disabled'}" id="chooseArchiveFolder">${icon('folder', 15)}${folder ? 'Change…' : 'Choose…'}</button>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="set-row">
+        <div class="txt">
+          <div class="t">Archive today's data</div>
+          <div class="d">Saves today's bills — with the customers, items and settings needed to read them
+            later — to that location, then removes those bills from the app.
+            <b>Stock is not affected:</b> goods that left the shop stay gone from the shelf.</div>
+        </div>
+        <button class="btn btn-primary ${owner ? '' : 'is-disabled'}" id="archiveToday">${icon('save', 15)}Archive today…</button>
+      </div>
+
+      <div class="set-row">
+        <div class="txt">
+          <div class="t">Archive another day, or a range</div>
+          <div class="d">For catching up on days that were missed.</div>
+        </div>
+        <div class="row gap2" style="align-items:center">
+          <input class="input input-sm mono" id="arcFrom" type="date" value="${esc(todayISO())}" style="width:150px">
+          <span class="small muted">to</span>
+          <input class="input input-sm mono" id="arcTo" type="date" value="${esc(todayISO())}" style="width:150px">
+          <button class="btn ${owner ? '' : 'is-disabled'}" id="archiveRange">${icon('save', 14)}Archive</button>
+        </div>
+      </div>
+
+      <div class="divider"></div>
+
+      <div class="row gap3" style="padding:10px 12px;background:var(--surface-2);border-radius:var(--r-md)">
+        ${icon('info', 16)}
+        <div class="small grow">
+          An archive is a complete little copy of the app for those days — double-click one and it opens
+          here, read-only, with its own dashboard, bill history and customer pages.
+          Nothing is removed from this app until the archive has been written and read back to confirm it.
+          ${a.last_archived ? `<br><span class="muted">Last archived ${esc(a.last_archived)}.</span>` : ''}
+        </div>
+      </div>
+    </div>`;
+}
+
+function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+async function refreshArchiveSettings() {
+  try { S.archive = await api.archive_settings(); }
+  catch { S.archive = {}; }
+}
+
+async function doChooseArchiveFolder() {
+  try {
+    await api.choose_archive_folder();
+    await refreshArchiveSettings();
+    renderSection();
+    toast('Archive location saved', 'Archiving will go here from now on.', 'ok');
+  } catch (e) {
+    if (!/no folder/i.test(e.message || '')) toast('Could not set the location', e.message, 'bad');
+  }
+}
+
+async function doArchive(from, to) {
+  if (!S.archive?.folder) {
+    toast('Choose a location first', 'Pick the folder or pendrive archives should go to.', 'bad');
+    return;
+  }
+  let p;
+  try { p = await api.archive_preview(from, to); }
+  catch (e) { toast('Could not check that day', e.message, 'bad'); return; }
+
+  if (!p.bills) {
+    toast('Nothing to archive', `There are no bills dated ${from === to ? dmy(from) : dmy(from) + ' – ' + dmy(to)}.`, 'info');
+    return;
+  }
+  if (!p.folder_exists) {
+    toast('Location not available', `${p.folder}\n\nIf it is a pendrive, plug it in and try again.`, 'bad', 8000);
+    return;
+  }
+
+  let mode = 'append';
+  if (p.existing) {
+    // A file for these dates is already there. Adding to it is safe and
+    // idempotent, so it is the default and the recommended answer - but
+    // the other two are offered rather than assumed.
+    const choice = await modal({
+      title: 'There is already an archive for this', icon: 'warn',
+      body: node(`<div class="col gap4">
+        <div class="small">The file <b>${esc(p.filename)}</b> is already at that location${
+          p.existing.bills != null ? `, holding <b>${p.existing.bills} bill${p.existing.bills === 1 ? '' : 's'}</b>${
+            p.existing.from ? ` from ${esc(dmy(p.existing.from))} to ${esc(dmy(p.existing.to))}` : ''}` : ''}.</div>
+        <div class="small muted">Adding to it is the safe answer: a bill that is already in there is
+          recognised and not written twice.</div>
+      </div>`),
+      actions: [
+        { label: 'Cancel', value: '' },
+        { label: 'Save alongside it', value: 'new' },
+        { label: 'Start the file again', cls: 'btn-danger', value: 'replace' },
+        { label: 'Add to it', cls: 'btn-primary', default: true, value: 'append' },
+      ],
+    });
+    if (!choice) return;
+    mode = choice;
+  }
+
+  const when = from === to ? dmy(from) : `${dmy(from)} – ${dmy(to)}`;
+  const yes = await confirm(`Archive ${when}?`,
+    `${p.bills} bill${p.bills === 1 ? '' : 's'}`
+    + (p.sales ? ` (${p.sales} sale${p.sales === 1 ? '' : 's'} worth ${inr(p.sales_value)}` : '')
+    + (p.purchases ? `${p.sales ? ', ' : ' ('}${p.purchases} purchase${p.purchases === 1 ? '' : 's'}` : '')
+    + (p.sales || p.purchases ? ')' : '')
+    + `\n\nSaved to:\n${p.path}\n\n`
+    + (mode === 'replace' ? 'That file will be started again (the old one is kept beside it, renamed).\n\n' : '')
+    + 'They are then removed from this app. Stock is NOT affected — what was sold stays sold.\n\n'
+    + 'Nothing is removed until the archive has been written and read back to confirm it.',
+    { ok: 'Archive and remove', danger: true });
+  if (!yes) return;
+
+  try {
+    const r = await api.archive_run(from, to, mode, true);
+    toast('Archived',
+      `${r.archived} bill${r.archived === 1 ? '' : 's'} saved to ${r.path}`
+      + (r.purged ? ` and removed from the app.` : '.')
+      + (r.already_present ? ` ${r.already_present} were already in that file.` : ''),
+      'ok', 9000);
+    await refreshArchiveSettings();
+    renderSection();
+  } catch (e) {
+    toast('Nothing was archived', e.message, 'bad', 10000);
   }
 }

@@ -40,6 +40,13 @@ export default {
     wire();
 
     ctx.setActions([
+      // Inherited from the old Bill PDFs screen, which was otherwise a
+      // second listing of these same rows (see the round 7 notes). This
+      // is the app's only direct route to the folder the bill PDFs live
+      // in, and nothing ever deletes an old PDF, so it is the one door
+      // to clearing them out by hand.
+      { label: 'PDF folder', icon: 'folder', cls: 'btn-ghost',
+        onClick: () => api.open_folder('pdfs').catch(e => toast('Could not open the folder', e.message, 'bad')) },
       { label: 'New bill', icon: 'plusCircle', cls: 'btn-grad', onClick: () => ctx.go('newbill') },
     ]);
 
@@ -317,6 +324,11 @@ function wireDetailButtons(b) {
   const host = q('#detailPanel', S.root);
   q('#detailClose', host).onclick = () => { S.selectedId = null; S.selectedBill = null; renderDetail(); renderTbody(); };
   q('#detailMore', host).onclick = (e) => menu(e.currentTarget, [
+    { label: 'Show the PDF in its folder', icon: 'folder',
+      onClick: async () => {
+        try { await api.reveal(b.id); }
+        catch (e2) { toast('Could not show the file', e2.message, 'bad'); }
+      } },
     { label: 'Send on WhatsApp', icon: 'whatsapp', disabled: !b.customer_phone,
       onClick: async () => {
         toast('Opening WhatsApp Web…', 'Leave the browser window open until the message is sent.', 'info');

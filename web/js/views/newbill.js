@@ -537,28 +537,24 @@ function recalc() {
   return { sub, add, less, total };
 }
 
-/** How many packs are going out with this bill, so the load can be
-    counted against the paper before it leaves. Units are kept apart -
-    "12 Carton + 3 Bundle" - because adding cartons to bundles would
-    produce a number that is true of nothing. Matches the total printed
-    on the PDF (see pdf_generator.py). */
+/** How many big packs are going out with this bill: ONE number, counting
+    cartons, bundles and boxes together, because it is a loading check.
+    15 is a thing you can count against a stack on the vehicle; "12
+    Carton + 3 Bundle" is a sum you have to do yourself first. A line
+    sold loose has no pack and adds nothing. Matches the total printed on
+    the PDF (see pdf_generator.py). */
 function paintPackTotal() {
   const line = q('#s-packs-line', S.root);
   if (!line) return;
-  const totals = new Map();
+  let packs = 0;
   for (const r of S.rows) {
     if (!validRow(r)) continue;
-    const unit = (r.packUnit || '').trim();
-    const packs = num(r.pack.value, 0);
-    if (!unit || !packs) continue;          // sold loose - nothing to count
-    totals.set(unit, (totals.get(unit) || 0) + packs);
+    if (!(r.packUnit || '').trim()) continue;   // sold loose
+    packs += num(r.pack.value, 0);
   }
-  if (!totals.size) { line.hidden = true; return; }
+  if (!packs) { line.hidden = true; return; }
   line.hidden = false;
-  q('#s-packs', S.root).textContent = [...totals.entries()]
-    .sort((a, b) => b[1] - a[1])
-    .map(([unit, n]) => `${fmtQty(n)} ${unit}`)
-    .join(' + ');
+  q('#s-packs', S.root).textContent = fmtQty(packs);
 }
 
 /* ============================ the keyboard grid ============================ */

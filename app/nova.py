@@ -12,6 +12,7 @@ with that path as argv[1] - see _pending_view_path().
 """
 
 import os
+import shutil
 import sys
 import threading
 
@@ -36,6 +37,7 @@ def resource_path(*parts):
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import applog          # noqa: E402
+import appdata         # noqa: E402
 import database         # noqa: E402
 import security         # noqa: E402
 import brand             # noqa: E402
@@ -152,23 +154,89 @@ def _fatal(message, detail=""):
     print(f"{message}\n{detail}", file=sys.stderr)
 
 
+def _prune_old(folder, days=30):
+    """Deletes files in a scratch folder that nothing is waiting on.
+    Best-effort: a file Windows still has open is skipped, not fatal."""
+    import time
+    cutoff = time.time() - days * 86400
+    try:
+        for name in os.listdir(folder):
+            p = os.path.join(folder, name)
+            try:
+                if os.path.isfile(p) and os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _open_as_archive(path):
+    """Prepares an archive file for viewing and locks the app read-only.
+
+    Three steps, in this order and for these reasons:
+
+      1. COPY it. The file lives on a pendrive that can be pulled out,
+         and it is the owner's only record of that day - the app must not
+         hold a handle on the original, let alone write to it. Everything
+         from here on happens to a copy in the app's own folder.
+      2. MIGRATE the copy. An archive written months ago will be missing
+         whatever columns and tables have been added since, and every
+         screen would fail on it. init_db() brings the copy up to date -
+         which is safe precisely because it is a copy.
+      3. LOCK it. database.open_archive() flips every connection from
+         here on to ?mode=ro, so nothing in the app can write to it even
+         by accident. See database.get_connection().
+
+    Returns True when the app should run in archive mode.
+    """
+    try:
+        copy_dir = appdata.subdir("archive-view")
+        # Working copies of archives opened in the past are of no use to
+        # anyone once the window is closed. Left alone they would sit in
+        # the app's folder for ever, one per archive ever double-clicked.
+        _prune_old(copy_dir, days=30)
+        # One copy per source file, reused: opening the same archive twice
+        # should not leave a folder full of near-identical databases.
+        stamp = "%08x" % (abs(hash(os.path.abspath(path))) & 0xFFFFFFFF)
+        copy_path = os.path.join(copy_dir, f"view-{stamp}.db")
+        shutil.copyfile(path, copy_path)
+        for sidecar in ("-wal", "-shm"):
+            stale = copy_path + sidecar
+            if os.path.exists(stale):
+                os.remove(stale)
+
+        database.DB_PATH = copy_path
+        database.DB_DIR = copy_dir
+        database.init_db()                     # migrate the COPY, never the original
+        database.open_archive(copy_path, source_path=path)
+        applog.info(f"Opened archive read-only: {path}")
+        return True
+    except Exception as e:
+        applog.report_error(e, "open_archive")
+        _fatal("That archive could not be opened.",
+               "The file may be damaged, or it may not be a Vikray archive.\n\n"
+               f"File: {path}\n\nDetail: {type(e).__name__}: {e}")
+        return False
+
+
 def main():
     applog.install_global_handler()
     applog.info(f"{brand.APP_NAME} starting.")
 
+    # A double-clicked archive opens the WHOLE app against that file
+    # instead of the shop's live data - dashboard, bill history, customer
+    # insights, all of it, showing the day that was archived. The original
+    # app answered this with a separate cut-down Tk viewer; reusing the
+    # real app is both less code and a better answer, because every screen
+    # the owner already knows works on the archive too.
+    #
+    # See _open_as_archive() for how it is made safe.
     view_path = _pending_view_path()
-    if view_path:
-        # The original app opened a separate read-only Tk viewer here
-        # instead of the main app (backup_viewer.py) so a double-clicked
-        # archive file could never accidentally modify live data. That
-        # standalone viewer window is Tk-based UI and is not part of this
-        # pywebview rewrite's scope - noted here rather than silently
-        # ignoring the double-click.
-        applog.info(f"Archive file opened directly: {view_path} "
-                   f"(read-only .bbak viewer is not part of this build; "
-                   f"use Settings > Import Data inside the app instead).")
+    archive_mode = bool(view_path) and _open_as_archive(view_path)
 
-    database.init_db()
+    if not archive_mode:
+        database.init_db()
 
     # Phase 6a: refuse to run against a database newer than this build
     # knows about, rather than silently corrupting it. Must run before
@@ -181,13 +249,19 @@ def main():
         _fatal("Database version mismatch", error_msg)
         return
 
-    if not _claim_single_instance():
-        applog.info("Another copy is already running; this one is closing.")
-        return
+    # An archive is opened to look at, and more than one can reasonably be
+    # open at once - so the single-instance lock and the nightly
+    # maintenance (auto-backup, update check) are both skipped. Neither
+    # has anything to do with a file on a pendrive, and the backup job in
+    # particular must never run against one.
+    if not archive_mode:
+        if not _claim_single_instance():
+            applog.info("Another copy is already running; this one is closing.")
+            return
 
-    # Maintenance runs in the background so the window opens fast - see
-    # the module docstring and the original main.py it mirrors.
-    threading.Thread(target=_run_maintenance, daemon=True).start()
+        # Maintenance runs in the background so the window opens fast - see
+        # the module docstring and the original main.py it mirrors.
+        threading.Thread(target=_run_maintenance, daemon=True).start()
 
     try:
         import webview
@@ -210,6 +284,10 @@ def main():
 
     shop_name = database.get_setting("store_name", "")
     title = brand.window_title(shop_name)
+    if archive_mode:
+        # The window's own title says what it is, so an archive and the
+        # live app are never confused on a taskbar.
+        title = f"{title} — ARCHIVE (read only): {os.path.basename(view_path)}"
 
     # maximized: the shop runs this on a full-size monitor all day and
     # expects it to fill the screen the moment it opens, the way the old

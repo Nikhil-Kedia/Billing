@@ -80,6 +80,7 @@ always returns True regardless of the above, so none of this changes
 anything for a shop that has never turned sign-in on.
 """
 
+import io
 import os
 import sys
 import sqlite3
@@ -182,6 +183,17 @@ def api_method(fn):
             title = "Not allowed" if isinstance(e, security.PermissionDenied) else "Check the details"
             return bad(str(e), title)
         except sqlite3.Error as e:
+            # Archive viewing mode opens the database read-only at the
+            # SQLite level (see database.open_archive), so any write -
+            # including one from a screen that has not been taught about
+            # archives yet - lands here. Translating it once, at the one
+            # place every call passes through, means nothing has to be
+            # kept in step with a list of blocked methods.
+            if db.is_read_only() and "readonly" in str(e).lower():
+                return bad(
+                    "This is an archived copy of past trading, opened for reading.\n\n"
+                    "Nothing in it can be changed. Open the app itself to make changes.",
+                    "Archived snapshot")
             msg = applog.friendly_db_error(e, "That could not be saved. Please try again.", fn.__name__)
             return bad(msg, "Something went wrong")
         except Exception as e:
@@ -339,6 +351,11 @@ class Api:
             # open, so the UI prompts for an owner account.
             "auth_needs_owner": (db.get_setting("auth_enabled", "0") == "1"
                                  and db.count_owners() == 0),
+            # Opened by double-clicking an archive file: the whole app is
+            # showing a past day and can change none of it.
+            "archive": ({"path": db.archive_source_path(),
+                          "name": os.path.basename(db.archive_source_path())}
+                        if db.is_read_only() else None),
         }
 
     @staticmethod
@@ -392,7 +409,14 @@ class Api:
         first, last = db.get_bill_date_bounds()
         return {"first": first, "last": last}
 
-    def _dashboard(self, range_key, month=None):
+    def _dashboard_window(self, range_key, month=None):
+        """(from, to, prev_from, prev_to, resolved_month) as ISO strings.
+
+        Lifted out of _dashboard() so the Earnings screen resolves a
+        range name to the very same dates. Two screens that both say
+        "Month" and mean different months would make every profit figure
+        on one of them look wrong.
+        """
         if range_key not in ("today", "week", "month", "all"):
             range_key = "month"
         today = date.today()
@@ -439,6 +463,12 @@ class Api:
             prev_to = cur_from - timedelta(days=1)
             prev_from = prev_to - timedelta(days=span - 1)
             prev_from_s, prev_to_s = prev_from.isoformat(), prev_to.isoformat()
+
+        return cur_from_s, cur_to_s, prev_from_s, prev_to_s, resolved_month
+
+    def _dashboard(self, range_key, month=None):
+        cur_from_s, cur_to_s, prev_from_s, prev_to_s, resolved_month = \
+            self._dashboard_window(range_key, month)
 
         summary = db.get_sales_summary(cur_from_s, cur_to_s)
         prev_summary = db.get_sales_summary(prev_from_s, prev_to_s) if prev_from_s else None
@@ -1108,20 +1138,6 @@ class Api:
         return message
 
     @api_method
-    def pdf_list(self):
-        out = []
-        for b in db.get_all_bills():
-            path = self._bill_pdf_path(b)
-            exists = os.path.isfile(path)
-            out.append({
-                "bill_id": b["id"], "bill_number": b["bill_number"], "customer_name": b["customer_name"],
-                "date": b["bill_date"],
-                "size_kb": round(os.path.getsize(path) / 1024, 1) if exists else 0,
-                "filename": os.path.basename(path), "exists": exists,
-            })
-        return out
-
-    @api_method
     def reveal(self, bill_id):
         bill = db.get_bill(bill_id)
         if not bill:
@@ -1414,6 +1430,147 @@ class Api:
         security.require(security.PERM_VIEW_ANALYTICS)
         return db.get_customer_product_history(customer_id, item_name)
 
+    # ------------------------------------------------------------ earnings
+    # The profit workspace. Everything here is owner-only and says so in
+    # one place: _earn_guard(). The date window is resolved by the SAME
+    # code the dashboard uses (_resolve_window), so "Month" means the
+    # same month on both screens - two screens quoting different profits
+    # for the same word would undo the point of having this one.
+
+    @staticmethod
+    def _earn_guard():
+        security.require(security.PERM_VIEW_PROFIT)
+
+    def _resolve_window(self, range_key, month=None, date_from=None, date_to=None):
+        """(from, to) as 'YYYY-MM-DD' strings, or (None, None) for all time.
+
+        An explicit from/to wins - the drill-downs pass the window they
+        were opened with, so a bill list can never quietly cover a
+        different period than the total it came from.
+        """
+        if date_from or date_to:
+            return (date_from or None), (date_to or None)
+        window = self._dashboard_window(range_key, month)
+        return window[0], window[1]
+
+    @api_method
+    def earnings(self, range="month", month=None):
+        """Everything the Earnings overview needs, in one call: the
+        headline, the daily trend, and the three rankings. One round trip
+        rather than five, because they are always shown together and a
+        half-loaded screen of money figures invites the wrong
+        conclusion."""
+        self._earn_guard()
+        date_from, date_to = self._resolve_window(range, month)
+        summary = db.earnings_summary(date_from, date_to)
+
+        # Same-length previous window, so the headline can say whether
+        # profit is up or down without the reader doing arithmetic.
+        prev = None
+        if date_from and date_to:
+            try:
+                f = date.fromisoformat(date_from)
+                t = date.fromisoformat(date_to)
+                span = (t - f).days + 1
+                p_to = f - timedelta(days=1)
+                p_from = p_to - timedelta(days=span - 1)
+                prev = db.earnings_summary(p_from.isoformat(), p_to.isoformat())
+            except ValueError:
+                prev = None
+
+        def pct(cur, before):
+            if before in (None, 0):
+                return None
+            try:
+                return round((cur - before) / abs(before) * 100, 1)
+            except (TypeError, ZeroDivisionError):
+                return None
+
+        return {
+            "range": range,
+            "month": month,
+            "date_from": date_from,
+            "date_to": date_to,
+            "summary": summary,
+            "delta": {
+                "profit": pct(summary.get("profit") or 0, (prev or {}).get("profit")),
+                "revenue": pct(summary.get("revenue") or 0, (prev or {}).get("revenue")),
+            } if prev else {},
+            "daily": db.earnings_daily(date_from, date_to),
+            "items": db.earnings_by_item(date_from, date_to, limit=100),
+            "customers": db.earnings_by_customer(date_from, date_to, limit=100),
+            "categories": db.earnings_by_category(date_from, date_to, limit=40),
+        }
+
+    @api_method
+    def earnings_bills(self, range="month", month=None, item_name=None, customer_name=None,
+                        date_from=None, date_to=None, limit=500):
+        """The middle of the drill-down: the bills behind one item, one
+        customer, or the whole period."""
+        self._earn_guard()
+        f, t = self._resolve_window(range, month, date_from, date_to)
+        return {
+            "date_from": f, "date_to": t,
+            "item_name": item_name or None,
+            "customer_name": customer_name or None,
+            "bills": db.earnings_by_bill(f, t, limit=limit,
+                                          item_name=item_name or None,
+                                          customer_name=customer_name or None),
+        }
+
+    @api_method
+    def bill_profit(self, bill_id):
+        """The bottom of the drill-down: one bill, line by line, with the
+        cost that was actually applied when its profit was worked out -
+        not the item's cost price as it stands today. See
+        database.bill_profit_detail()."""
+        self._earn_guard()
+        detail = db.bill_profit_detail(bill_id)
+        if not detail:
+            raise ValidationError("That bill could not be found. It may have been deleted.")
+        return detail
+
+    @api_method
+    def earnings_checks(self, range="month", month=None, date_from=None, date_to=None):
+        """Lines that look like a billing or costing mistake."""
+        self._earn_guard()
+        f, t = self._resolve_window(range, month, date_from, date_to)
+        return db.earnings_checks(f, t)
+
+    @api_method
+    def earnings_export(self, range="month", month=None, view="items"):
+        """Writes the current view to CSV. The owner asked for this
+        screen partly to hunt for mistakes, and a spreadsheet is where
+        that kind of hunting actually finishes."""
+        self._earn_guard()
+        f, t = self._resolve_window(range, month)
+        if view == "customers":
+            rows = db.earnings_by_customer(f, t, limit=100000)
+            head = ["Customer", "Bills", "Revenue", "Cost", "Profit", "Margin %"]
+            body = [[r["label"], r["bills"], r["revenue"], r["cost"], r["profit"], r["margin"]]
+                    for r in rows]
+            default = "profit_by_customer.csv"
+        elif view == "bills":
+            rows = db.earnings_by_bill(f, t, limit=100000)
+            head = ["Bill", "Date", "Customer", "Revenue", "Cost", "Profit", "Margin %"]
+            body = [[r["bill_number"], r["bill_date"], r["customer_name"],
+                     r["revenue"], r["cost"], r["profit"], r["margin"]] for r in rows]
+            default = "profit_by_bill.csv"
+        else:
+            rows = db.earnings_by_item(f, t, limit=100000)
+            head = ["Item", "Quantity", "Bills", "Revenue", "Cost", "Profit", "Margin %"]
+            body = [[r["label"], r["quantity"], r["bills"], r["revenue"], r["cost"],
+                     r["profit"], r["margin"]] for r in rows]
+            default = "profit_by_item.csv"
+
+        path = self._pick_save_file(default, ("CSV File (*.csv)",))
+        with io.open(path, "w", encoding="utf-8-sig", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(head)
+            w.writerows(body)
+        db.log_audit("earnings.export", f"{len(body)} rows exported to {os.path.basename(path)}")
+        return path
+
     # ------------------------------------------------------------ settings
     @api_method
     def get_settings(self):
@@ -1578,6 +1735,164 @@ class Api:
         else:
             path = appdata.data_dir()
         _open_folder(path)
+        return True
+
+    # ------------------------------------------------------------ archiving
+    # Taking a day's trade off to a pendrive and out of the live file.
+    # The dangerous half of this is the deletion, so the rules are in
+    # backup_restore.archive_and_purge(): write, read the file back from
+    # disk, count the bills in it, and only then remove anything. Stock is
+    # never touched - see purge_archived_bills().
+
+    ARCHIVE_DIR_KEY = "archive_dir"
+
+    @api_method
+    def archive_settings(self):
+        """Where archives go, and whether that place is currently there.
+
+        A pendrive that is not plugged in is the normal case, not an
+        error - the screen just needs to know so it can say so instead of
+        failing at the moment the owner presses the button.
+        """
+        folder = db.get_setting(self.ARCHIVE_DIR_KEY, "") or ""
+        return {
+            "folder": folder,
+            "exists": bool(folder) and os.path.isdir(folder),
+            "last_archived": db.get_setting("archive_last", "") or "",
+        }
+
+    @api_method
+    def choose_archive_folder(self):
+        """Asks for the folder once. After this the button just works."""
+        security.require(security.PERM_BACKUP_DATA)
+        window = webview.windows[0]
+        result = window.create_file_dialog(webview.FOLDER_DIALOG)
+        if not result:
+            raise ValidationError("No folder was chosen.")
+        folder = result[0] if isinstance(result, (list, tuple)) else result
+        if not os.path.isdir(folder):
+            raise ValidationError("That folder could not be found.")
+        db.set_setting(self.ARCHIVE_DIR_KEY, folder)
+        db.log_audit("archive.folder", f"Archive location set to {folder}")
+        return {"folder": folder}
+
+    @api_method
+    def archive_preview(self, date_from=None, date_to=None):
+        """What archiving right now would take, and what it would find
+        already sitting at the destination. Everything the confirmation
+        needs in order to be specific rather than reassuring."""
+        security.require(security.PERM_BACKUP_DATA)
+        d_from = validation.bill_date(date_from) if date_from else date.today().isoformat()
+        d_to = validation.bill_date(date_to) if date_to else d_from
+        if d_to < d_from:
+            d_from, d_to = d_to, d_from
+
+        conn = db.get_connection()
+        row = conn.execute("""
+            SELECT COUNT(*) AS bills,
+                   COALESCE(SUM(CASE WHEN bill_type='sale' THEN 1 ELSE 0 END), 0) AS sales,
+                   COALESCE(SUM(CASE WHEN bill_type='purchase' THEN 1 ELSE 0 END), 0) AS purchases,
+                   COALESCE(SUM(CASE WHEN bill_type='sale' THEN total ELSE 0 END), 0) AS sales_value
+            FROM bills WHERE bill_date >= ? AND bill_date <= ?
+        """, (d_from, d_to)).fetchone()
+        conn.close()
+
+        folder = db.get_setting(self.ARCHIVE_DIR_KEY, "") or ""
+        filename = br.archive_filename(d_from, d_to)
+        dest = os.path.join(folder, filename) if folder else ""
+        existing = None
+        if dest and os.path.isfile(dest):
+            # Say what is already in that file, so "add to it" is an
+            # informed choice rather than a leap.
+            try:
+                c2 = br._read_only_conn(dest)
+                n = c2.execute("SELECT COUNT(*) AS n FROM bills").fetchone()["n"]
+                dates = c2.execute("SELECT MIN(bill_date) AS a, MAX(bill_date) AS b FROM bills").fetchone()
+                c2.close()
+                existing = {"bills": n, "from": dates["a"], "to": dates["b"],
+                            "size_kb": round(os.path.getsize(dest) / 1024, 1)}
+            except Exception:
+                existing = {"bills": None}
+
+        return {
+            "date_from": d_from, "date_to": d_to,
+            "bills": row["bills"], "sales": row["sales"], "purchases": row["purchases"],
+            "sales_value": row["sales_value"],
+            "folder": folder, "folder_exists": bool(folder) and os.path.isdir(folder),
+            "filename": filename, "path": dest, "existing": existing,
+        }
+
+    @api_method
+    def archive_run(self, date_from=None, date_to=None, mode="append", purge=True):
+        """Archives a date range and, once the file has been verified,
+        removes those bills from the live data.
+
+        mode:
+          append  - add to the file already there (the safe default:
+                    re-archiving a day it already holds adds nothing)
+          replace - start that file again from scratch
+          new     - write alongside it under a numbered name
+
+        Stock is never affected. See backup_restore.purge_archived_bills.
+        """
+        security.require(security.PERM_BACKUP_DATA)
+        if db.is_read_only():
+            raise ValidationError("This is an archived snapshot. It cannot archive anything itself.")
+
+        folder = db.get_setting(self.ARCHIVE_DIR_KEY, "") or ""
+        if not folder:
+            raise ValidationError("Choose where archives should be saved first.")
+        if not os.path.isdir(folder):
+            raise ValidationError(
+                f"The archive location is not available right now:\n{folder}\n\n"
+                "If it is a pendrive, plug it in and try again — or choose a different location.")
+
+        d_from = validation.bill_date(date_from) if date_from else date.today().isoformat()
+        d_to = validation.bill_date(date_to) if date_to else d_from
+        if d_to < d_from:
+            d_from, d_to = d_to, d_from
+
+        dest = os.path.join(folder, br.archive_filename(d_from, d_to))
+        if mode == "replace" and os.path.isfile(dest):
+            # Kept, not deleted. Replacing an archive is the one action
+            # here that could lose something, and a file named .bak-1 is
+            # a cheap apology next to a day of trade that no longer
+            # exists anywhere.
+            backup = dest + ".replaced-" + datetime.now().strftime("%Y%m%d%H%M%S")
+            os.replace(dest, backup)
+            db.log_audit("archive.replace", f"Previous archive kept as {os.path.basename(backup)}")
+        elif mode == "new":
+            stem, ext = os.path.splitext(dest)
+            n = 2
+            while os.path.isfile(f"{stem} ({n}){ext}"):
+                n += 1
+            dest = f"{stem} ({n}){ext}"
+
+        summary = br.archive_and_purge(dest, d_from, d_to, purge=bool(purge))
+        if summary.get("nothing_to_do"):
+            raise ValidationError(f"There are no bills dated {d_from}"
+                                  + ("" if d_from == d_to else f" to {d_to}") + " to archive.")
+        if not summary.get("verified"):
+            db.log_audit("archive.failed", f"{d_from}..{d_to}: {summary.get('error')}",
+                          outcome="denied")
+            raise ValidationError(
+                "The archive could not be confirmed, so nothing has been removed "
+                "from the app.\n\n" + (summary.get("error") or ""))
+
+        db.set_setting("archive_last", db.now_str())
+        db.log_audit("archive.run",
+                      f"{summary['archived']} bill(s) for {d_from}..{d_to} archived to "
+                      f"{os.path.basename(dest)}; {summary['purged']} removed from the app")
+        summary["path"] = dest
+        summary["date_from"], summary["date_to"] = d_from, d_to
+        return summary
+
+    @api_method
+    def open_archive_folder(self):
+        folder = db.get_setting(self.ARCHIVE_DIR_KEY, "") or ""
+        if not folder or not os.path.isdir(folder):
+            raise ValidationError("No archive location is set, or it is not available right now.")
+        _open_folder(folder)
         return True
 
     # ------------------------------------------------------------ auth

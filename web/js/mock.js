@@ -304,9 +304,75 @@ export const mockApi = {
   open_pdf: async () => ok(true),
   print_bill: async () => ok(true),
   send_whatsapp: async () => ok('Sent'),
-  pdf_list: async () => ok(bills.slice(0, 24).map(b => ({
-    bill_id: b.id, bill_number: b.bill_number, customer_name: b.customer_name,
-    date: b.bill_date, size_kb: 60 + Math.floor(rnd() * 70), filename: b.bill_number + '.pdf', exists: true }))),
+  reveal: async () => ok(true),
+
+  // Earnings (owner-only). Enough shape for the browser preview to
+  // render every level of the drill-down.
+  earnings: async (range) => {
+    const days = Array.from({ length: 24 }, (_, i) => {
+      const d = new Date(); d.setDate(d.getDate() - (23 - i));
+      const revenue = Math.round(8000 + rnd() * 26000);
+      const profit = Math.round(revenue * (0.06 + rnd() * 0.22)) * (rnd() > .92 ? -1 : 1);
+      return { date: d.toISOString().slice(0, 10), revenue, cost: revenue - profit, profit,
+               margin: +(profit / revenue * 100).toFixed(2) };
+    });
+    const sum = (k) => days.reduce((a, d) => a + d[k], 0);
+    const mk = (label, extra = {}) => {
+      const revenue = Math.round(4000 + rnd() * 40000);
+      const profit = Math.round(revenue * (0.05 + rnd() * 0.25));
+      return { label, revenue, cost: revenue - profit, profit,
+               margin: +(profit / revenue * 100).toFixed(2), bills: 1 + Math.floor(rnd() * 12),
+               uncosted_lines: rnd() > .85 ? 1 : 0, ...extra };
+    };
+    return ok({
+      range, date_from: days[0].date, date_to: days[days.length - 1].date,
+      summary: { revenue: sum('revenue'), cost: sum('cost'), profit: sum('profit'),
+                 margin: +(sum('profit') / sum('revenue') * 100).toFixed(2),
+                 bills: 96, lines: 240, uncosted_lines: 3,
+                 costed_revenue: Math.round(sum('revenue') * 0.94), costed_pct: 94 },
+      delta: { profit: 12.4, revenue: 8.1 },
+      daily: days,
+      items: items.slice(0, 14).map(i => mk(i.name, { quantity: Math.round(20 + rnd() * 400) })),
+      customers: customers.slice(0, 12).map(c => mk(c.name)),
+      categories: ['Groceries', 'Dairy', 'Snacks', 'Household'].map(c => mk(c)),
+    });
+  },
+  earnings_bills: async (range, month, itemName, customerName) => ok({
+    date_from: null, date_to: null, item_name: itemName || null, customer_name: customerName || null,
+    bills: bills.slice(0, 18).map(b => {
+      const revenue = Math.round(b.total);
+      const profit = Math.round(revenue * (0.04 + rnd() * 0.26));
+      return { bill_id: b.id, bill_number: b.bill_number, bill_date: b.bill_date, bill_time: b.bill_time,
+               customer_name: b.customer_name, bill_total: b.total, lines: 3, uncosted_lines: 0,
+               revenue, cost: revenue - profit, profit, margin: +(profit / revenue * 100).toFixed(2) };
+    }),
+  }),
+  bill_profit: async (billId) => {
+    const b = bills.find(x => x.id === billId) || bills[0];
+    const lines = (b.items || []).map(li => {
+      const rev = li.final_price;
+      const costUnit = +(li.price_per_unit * (0.62 + rnd() * 0.2)).toFixed(2);
+      const cost = +(costUnit * li.quantity).toFixed(2);
+      return { ...li, line_revenue: rev, line_cost: cost, cost_per_unit: costUnit,
+               line_profit: +(rev - cost).toFixed(2), margin: +((rev - cost) / rev * 100).toFixed(2),
+               cost_source: rnd() > .85 ? 'default' : 'recorded', item_unit: 'Pcs' };
+    });
+    const revenue = lines.reduce((a, l) => a + l.line_revenue, 0);
+    const cost = lines.reduce((a, l) => a + l.line_cost, 0);
+    return ok({ bill: b, lines, is_sale: b.bill_type !== 'purchase',
+                revenue: +revenue.toFixed(2), cost: +cost.toFixed(2),
+                profit: +(revenue - cost).toFixed(2),
+                margin: +((revenue - cost) / revenue * 100).toFixed(2) });
+  },
+  earnings_checks: async () => {
+    const one = (n) => bills.slice(0, n).map(b => ({
+      bill_id: b.id, bill_number: b.bill_number, bill_date: b.bill_date,
+      customer_name: b.customer_name, item_name: pick(items).name,
+      quantity: 12, price_per_unit: 9, line_cost: 140, line_revenue: 108,
+      line_profit: -32, cost_at_sale: 140 }));
+    return ok({ sold_below_cost: one(2), no_cost: one(1), free: [], suspicious_margin: [] });
+  },
+  earnings_export: async () => ok('C:\\Users\\Demo\\profit_by_item.csv'),
 
   item_cost_layers: async (id) => {
     const it = items.find(x => x.id === id) || {};
@@ -387,6 +453,17 @@ export const mockApi = {
   import_items: async () => ok({ added: 0, updated: 0, skipped: 0 }),
   reveal: async () => ok(true),
   open_folder: async () => ok(true),
+  archive_settings: async () => ok({ folder: 'E:\\Vikray archives', exists: true, last_archived: '2026-09-05 21:40' }),
+  choose_archive_folder: async () => ok({ folder: 'E:\\Vikray archives' }),
+  archive_preview: async (from, to) => ok({
+    date_from: from, date_to: to, bills: 14, sales: 13, purchases: 1, sales_value: 184320,
+    folder: 'E:\\Vikray archives', folder_exists: true,
+    filename: `vikray-archive-${from}.bbak`, path: `E:\\Vikray archives\\vikray-archive-${from}.bbak`,
+    existing: null }),
+  archive_run: async (from) => ok({ archived: 14, already_present: 0, renumbered: 0, purged: 14,
+    verified: true, error: '', path: `E:\\Vikray archives\\vikray-archive-${from}.bbak`,
+    date_from: from, date_to: from }),
+  open_archive_folder: async () => ok(true),
   restore_backup: async () => ok({ restored: true }),
   reset_all_stock: async () => ok(true),
   create_user: async () => ok(2),

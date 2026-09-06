@@ -120,6 +120,15 @@ kbd {
   border-right: 1px solid var(--line);
 }
 .histnav .btn[disabled] { opacity: .32; pointer-events: none; }
+/* The archive band. Deliberately loud: the whole app looks identical
+   when it is showing a pendrive copy of last Tuesday, and the only thing
+   standing between that and confusion is this strip. */
+.archive-band {
+  flex: none; display: flex; align-items: center; gap: var(--s3);
+  padding: 9px var(--s5); font-size: var(--t-12);
+  background: var(--warn-soft); color: var(--warn-ink);
+  border-bottom: 1px solid var(--warn);
+}
 .topbar h1 { font-size: var(--t-15); font-weight: 660; letter-spacing: -.01em; }
 .topbar .sub { font-size: var(--t-12); color: var(--ink-3); margin-top: -1px; }
 .stage { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
