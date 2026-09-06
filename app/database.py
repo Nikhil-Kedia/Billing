@@ -6,6 +6,7 @@ Single-file database stored at data/balaji_billing.db
 
 import sqlite3
 import os
+import calendar
 from datetime import datetime
 import appdata
 
@@ -55,6 +56,7 @@ def init_db():
             category TEXT DEFAULT '',
             unit TEXT DEFAULT 'pcs',
             price REAL NOT NULL DEFAULT 0,
+            cost_price REAL NOT NULL DEFAULT 0,
             quantity REAL NOT NULL DEFAULT 0,
             low_stock_threshold REAL DEFAULT 5,
             pack_size REAL,
@@ -76,6 +78,17 @@ def init_db():
 
     try:
         cur.execute("ALTER TABLE items ADD COLUMN pack_unit_name TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+
+    # Cost price per item, for the owner-only profit/loss feature. Never
+    # printed on a bill PDF and never exposed to a staff account (see
+    # bridge.py's _read_item_form and security.PERM_VIEW_PROFIT) - this
+    # column just holds the number; who gets to see or set it is enforced
+    # entirely above the data layer, the same as everywhere else in this
+    # file.
+    try:
+        cur.execute("ALTER TABLE items ADD COLUMN cost_price REAL NOT NULL DEFAULT 0")
     except sqlite3.OperationalError:
         pass
 
@@ -202,6 +215,80 @@ def init_db():
         )
     """)
 
+    # ---- Employee attendance & payroll (owner-only module) ----
+    # Deliberately its own little world: nothing here is read by billing,
+    # inventory or the PDF generator, and none of it is in
+    # backup_restore._CATEGORY_TABLES's default set unless the owner
+    # explicitly includes it - see that module for the category name.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT DEFAULT '',
+            role TEXT DEFAULT '',
+            pay_type TEXT NOT NULL DEFAULT 'monthly',
+            pay_rate REAL NOT NULL DEFAULT 0,
+            joined_date TEXT,
+            active INTEGER NOT NULL DEFAULT 1,
+            notes TEXT DEFAULT '',
+            created_at TEXT,
+            updated_at TEXT
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            shifts REAL DEFAULT 1,
+            notes TEXT DEFAULT '',
+            marked_at TEXT,
+            UNIQUE(employee_id, date),
+            FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS employee_advances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            date TEXT NOT NULL,
+            amount REAL NOT NULL,
+            notes TEXT DEFAULT '',
+            settled INTEGER NOT NULL DEFAULT 0,
+            payroll_id INTEGER,
+            created_at TEXT,
+            FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS payroll_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL,
+            period_month TEXT NOT NULL,
+            present_days REAL NOT NULL DEFAULT 0,
+            half_days REAL NOT NULL DEFAULT 0,
+            absent_days REAL NOT NULL DEFAULT 0,
+            leave_days REAL NOT NULL DEFAULT 0,
+            gross_pay REAL NOT NULL DEFAULT 0,
+            advances_deducted REAL NOT NULL DEFAULT 0,
+            net_pay REAL NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            paid_date TEXT,
+            notes TEXT DEFAULT '',
+            created_at TEXT,
+            UNIQUE(employee_id, period_month),
+            FOREIGN KEY (employee_id) REFERENCES employees(id) ON DELETE CASCADE
+        )
+    """)
+
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_attendance_emp_date ON attendance(employee_id, date)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_advances_emp ON employee_advances(employee_id, settled)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_payroll_emp_month ON payroll_runs(employee_id, period_month)")
+
     # ---- Accounts & audit trail ----
     # Added for the security pass. Both tables are deliberately NOT part of
     # any backup category (see backup_restore._CATEGORY_TABLES): password
@@ -254,6 +341,11 @@ def init_db():
         "store_contact": "",
         "store_address": "Balangir, Odisha",
         "logo_path": "",
+        # GSTIN is stored regardless of the toggle, so switching it back on
+        # doesn't lose what the owner typed in. show_gstin controls only
+        # whether pdf_generator.py prints it on the bill.
+        "store_gstin": "",
+        "show_gstin": "0",
         "bill_prefix": "BS",
         "next_bill_seq": "1",
         # Off until the owner sets up the first account, so upgrading an
@@ -476,14 +568,14 @@ def advance_bill_sequence():
 # ---------------- ITEMS (INVENTORY) ----------------
 
 def add_item(item_code, name, category, unit, price, quantity, low_stock_threshold=5,
-             pack_size=None, pack_unit_name=""):
+             pack_size=None, pack_unit_name="", cost_price=0):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO items (item_code, name, category, unit, price, quantity, low_stock_threshold,
+        INSERT INTO items (item_code, name, category, unit, price, cost_price, quantity, low_stock_threshold,
                             pack_size, pack_unit_name, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (item_code, name, category, unit, price, quantity, low_stock_threshold,
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (item_code, name, category, unit, price, cost_price or 0, quantity, low_stock_threshold,
           pack_size, (pack_unit_name or "").strip(), now_str(), now_str()))
     item_id = cur.lastrowid
     if quantity:
@@ -495,15 +587,21 @@ def add_item(item_code, name, category, unit, price, quantity, low_stock_thresho
     return item_id
 
 def update_item(item_id, item_code, name, category, unit, price, quantity, low_stock_threshold,
-                 pack_size=None, pack_unit_name=""):
+                 pack_size=None, pack_unit_name="", cost_price=None):
     conn = get_connection()
     cur = conn.cursor()
     old = cur.execute("SELECT * FROM items WHERE id=?", (item_id,)).fetchone()
+    # cost_price=None means "leave it as it was" - the caller (bridge.py)
+    # passes None whenever the signed-in user isn't allowed to see or
+    # change it, so a staff member editing an item's price can never
+    # accidentally wipe out the cost price the owner recorded.
+    if cost_price is None:
+        cost_price = old["cost_price"] if old is not None else 0
     cur.execute("""
-        UPDATE items SET item_code=?, name=?, category=?, unit=?, price=?, quantity=?, low_stock_threshold=?,
+        UPDATE items SET item_code=?, name=?, category=?, unit=?, price=?, cost_price=?, quantity=?, low_stock_threshold=?,
                           pack_size=?, pack_unit_name=?, updated_at=?
         WHERE id=?
-    """, (item_code, name, category, unit, price, quantity, low_stock_threshold,
+    """, (item_code, name, category, unit, price, cost_price, quantity, low_stock_threshold,
           pack_size, (pack_unit_name or "").strip(), now_str(), item_id))
     if old is not None:
         diff = quantity - old["quantity"]
@@ -1723,5 +1821,313 @@ def get_customer_acquisition(date_from=None, date_to=None, granularity="day"):
     query, params = _date_window(query, [], date_from, date_to, "b.bill_date")
     query += " GROUP BY period ORDER BY period"
     rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ==================================================================
+# PROFIT / LOSS  (owner-only - see security.PERM_VIEW_PROFIT)
+#
+# Gross profit on a sale line = (price the customer paid - the item's
+# recorded cost price) x quantity. An item nobody has ever set a cost
+# price for defaults to cost_price=0, so its lines just show their full
+# sale price as "profit" - an honest placeholder, not a wrong number,
+# until the owner fills the cost in from Inventory.
+#
+# Purchase bills are stock coming IN, not a sale, so every query below
+# keeps the same bill_type='sale' filter the rest of the dashboard uses.
+# ==================================================================
+
+def get_profit_summary(date_from=None, date_to=None):
+    """Revenue, cost and gross profit for one date window, in one pass
+    so the three numbers can never disagree with each other."""
+    conn = get_connection()
+    query = """
+        SELECT COALESCE(SUM(bi.price_per_unit * bi.quantity), 0) AS revenue,
+               COALESCE(SUM(COALESCE(i.cost_price, 0) * bi.quantity), 0) AS cost,
+               COALESCE(SUM((bi.price_per_unit - COALESCE(i.cost_price, 0)) * bi.quantity), 0) AS profit
+        FROM bill_items bi
+        JOIN bills b ON bi.bill_id = b.id
+        LEFT JOIN items i ON bi.item_id = i.id
+        WHERE b.bill_type = 'sale'
+    """
+    query, params = _date_window(query, [], date_from, date_to, "b.bill_date")
+    row = conn.execute(query, params).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def get_daily_profit(date_from=None, date_to=None):
+    """Same shape as get_daily_performance(), but profit per day."""
+    conn = get_connection()
+    query = """
+        SELECT b.bill_date AS bill_date,
+               COALESCE(SUM((bi.price_per_unit - COALESCE(i.cost_price, 0)) * bi.quantity), 0) AS profit
+        FROM bill_items bi
+        JOIN bills b ON bi.bill_id = b.id
+        LEFT JOIN items i ON bi.item_id = i.id
+        WHERE b.bill_type = 'sale'
+    """
+    query, params = _date_window(query, [], date_from, date_to, "b.bill_date")
+    query += " GROUP BY b.bill_date ORDER BY b.bill_date"
+    rows = conn.execute(query, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ==================================================================
+# EMPLOYEE ATTENDANCE & PAYROLL  (owner-only - see
+# security.PERM_MANAGE_ATTENDANCE)
+#
+# A small, self-contained module: employees, one attendance mark per
+# employee per day, cash advances against salary, and monthly payroll
+# runs computed from attendance. Nothing here touches billing,
+# inventory or any PDF.
+# ==================================================================
+
+def get_employees(include_inactive=False):
+    conn = get_connection()
+    q = "SELECT * FROM employees"
+    if not include_inactive:
+        q += " WHERE active = 1"
+    q += " ORDER BY name"
+    rows = conn.execute(q).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_employee(employee_id):
+    conn = get_connection()
+    row = conn.execute("SELECT * FROM employees WHERE id=?", (employee_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def add_employee(name, phone, role, pay_type, pay_rate, joined_date, notes=""):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO employees (name, phone, role, pay_type, pay_rate, joined_date, active, notes, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+    """, (name, phone or "", role or "", pay_type, pay_rate, joined_date or now_str()[:10],
+          notes or "", now_str(), now_str()))
+    employee_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return employee_id
+
+
+def update_employee(employee_id, name, phone, role, pay_type, pay_rate, joined_date, notes=""):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE employees SET name=?, phone=?, role=?, pay_type=?, pay_rate=?, joined_date=?, notes=?, updated_at=?
+        WHERE id=?
+    """, (name, phone or "", role or "", pay_type, pay_rate, joined_date, notes or "", now_str(), employee_id))
+    conn.commit()
+    conn.close()
+
+
+def set_employee_active(employee_id, active):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE employees SET active=?, updated_at=? WHERE id=?",
+                (1 if active else 0, now_str(), employee_id))
+    conn.commit()
+    conn.close()
+
+
+def get_attendance_month(period_month):
+    """{employee_id: {date: {"status":..., "shifts":...}}} for one 'YYYY-MM'."""
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT employee_id, date, status, shifts FROM attendance WHERE substr(date, 1, 7) = ?",
+        (period_month,)
+    ).fetchall()
+    conn.close()
+    out = {}
+    for r in rows:
+        out.setdefault(r["employee_id"], {})[r["date"]] = {"status": r["status"], "shifts": r["shifts"]}
+    return out
+
+
+def mark_attendance(employee_id, date_str, status, shifts=None):
+    """status='clear' removes the mark for that day (an accidental drag,
+    or a day the owner wants to leave blank rather than 'absent')."""
+    conn = get_connection()
+    cur = conn.cursor()
+    if status == "clear":
+        cur.execute("DELETE FROM attendance WHERE employee_id=? AND date=?", (employee_id, date_str))
+    else:
+        cur.execute("""
+            INSERT INTO attendance (employee_id, date, status, shifts, marked_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(employee_id, date) DO UPDATE SET
+                status=excluded.status, shifts=excluded.shifts, marked_at=excluded.marked_at
+        """, (employee_id, date_str, status, shifts if shifts is not None else 1, now_str()))
+    conn.commit()
+    conn.close()
+
+
+def add_advance(employee_id, date_str, amount, notes=""):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO employee_advances (employee_id, date, amount, notes, settled, created_at)
+        VALUES (?, ?, ?, ?, 0, ?)
+    """, (employee_id, date_str, amount, notes or "", now_str()))
+    advance_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return advance_id
+
+
+def get_advances(employee_id=None, unsettled_only=False):
+    conn = get_connection()
+    q = "SELECT * FROM employee_advances WHERE 1=1"
+    params = []
+    if employee_id is not None:
+        q += " AND employee_id=?"
+        params.append(employee_id)
+    if unsettled_only:
+        q += " AND settled=0"
+    q += " ORDER BY date DESC, id DESC"
+    rows = conn.execute(q, params).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def delete_advance(advance_id):
+    """Only an unsettled advance can be removed - once it has paid off a
+    finalized payroll run it is part of that run's paper trail."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("DELETE FROM employee_advances WHERE id=? AND settled=0", (advance_id,))
+    conn.commit()
+    conn.close()
+
+
+def compute_payroll(employee_id, period_month):
+    """Pure calculation for one employee, one 'YYYY-MM' - never writes
+    anything. finalize_payroll() below is what saves it.
+
+    Monthly staff are paid pro-rata by the days in that calendar month
+    (rate / days_in_month x effective_days); daily-wage staff are paid
+    per day worked; shift-based staff are paid per shift logged. A paid
+    leave day and a present day count the same; a half-day counts half;
+    an absent day earns nothing - this is a simple, transparent default
+    the owner can see broken down before ever finalizing a month.
+    """
+    emp = get_employee(employee_id)
+    if not emp:
+        return None
+    year, mon = int(period_month[:4]), int(period_month[5:7])
+    days_in_month = calendar.monthrange(year, mon)[1]
+
+    conn = get_connection()
+    rows = conn.execute(
+        "SELECT status, shifts FROM attendance WHERE employee_id=? AND substr(date, 1, 7)=?",
+        (employee_id, period_month)
+    ).fetchall()
+    conn.close()
+
+    present = sum(1 for r in rows if r["status"] == "present")
+    half = sum(1 for r in rows if r["status"] == "half")
+    absent = sum(1 for r in rows if r["status"] == "absent")
+    leave = sum(1 for r in rows if r["status"] == "leave")
+    shifts_total = sum((r["shifts"] or 0) for r in rows if r["status"] in ("present", "half"))
+
+    pay_type = emp["pay_type"]
+    rate = emp["pay_rate"] or 0
+    effective_days = present + leave + 0.5 * half
+
+    if pay_type == "daily":
+        gross = round(rate * effective_days, 2)
+    elif pay_type == "shift":
+        gross = round(rate * shifts_total, 2)
+    else:  # "monthly"
+        gross = round(rate / days_in_month * effective_days, 2) if days_in_month else 0.0
+
+    unsettled = get_advances(employee_id, unsettled_only=True)
+    advances_total = round(sum(a["amount"] for a in unsettled), 2)
+    net = round(gross - advances_total, 2)
+
+    return {
+        "employee_id": employee_id, "employee_name": emp["name"], "period_month": period_month,
+        "pay_type": pay_type, "pay_rate": rate, "days_in_month": days_in_month,
+        "present_days": present, "half_days": half, "absent_days": absent, "leave_days": leave,
+        "shifts_total": shifts_total, "gross_pay": gross,
+        "advances_deducted": advances_total, "advance_ids": [a["id"] for a in unsettled],
+        "net_pay": net,
+    }
+
+
+def finalize_payroll(employee_id, period_month):
+    """Saves compute_payroll()'s numbers as a payroll_runs row and marks
+    every advance it deducted as settled against that run. Safe to call
+    again for the same employee+month before it is marked paid - it
+    replaces the previous (still-pending) numbers rather than doubling up,
+    thanks to the table's UNIQUE(employee_id, period_month)."""
+    calc = compute_payroll(employee_id, period_month)
+    if calc is None:
+        return None
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO payroll_runs (employee_id, period_month, present_days, half_days, absent_days, leave_days,
+                                   gross_pay, advances_deducted, net_pay, status, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+        ON CONFLICT(employee_id, period_month) DO UPDATE SET
+            present_days=excluded.present_days, half_days=excluded.half_days,
+            absent_days=excluded.absent_days, leave_days=excluded.leave_days,
+            gross_pay=excluded.gross_pay, advances_deducted=excluded.advances_deducted,
+            net_pay=excluded.net_pay
+    """, (employee_id, period_month, calc["present_days"], calc["half_days"], calc["absent_days"],
+          calc["leave_days"], calc["gross_pay"], calc["advances_deducted"], calc["net_pay"], now_str()))
+    conn.commit()
+    payroll_id = conn.execute(
+        "SELECT id FROM payroll_runs WHERE employee_id=? AND period_month=?",
+        (employee_id, period_month)
+    ).fetchone()["id"]
+    if calc["advance_ids"]:
+        cur.executemany("UPDATE employee_advances SET settled=1, payroll_id=? WHERE id=?",
+                         [(payroll_id, aid) for aid in calc["advance_ids"]])
+        conn.commit()
+    conn.close()
+    return payroll_id
+
+
+def mark_payroll_paid(payroll_id, paid_date=None):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE payroll_runs SET status='paid', paid_date=? WHERE id=?",
+                (paid_date or now_str()[:10], payroll_id))
+    conn.commit()
+    conn.close()
+
+
+def get_payroll_run(payroll_id):
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT p.*, e.name AS employee_name FROM payroll_runs p
+        JOIN employees e ON e.id = p.employee_id WHERE p.id=?
+    """, (payroll_id,)).fetchone()
+    conn.close()
+    return dict(row) if row else None
+
+
+def get_payroll_runs(period_month=None, employee_id=None):
+    conn = get_connection()
+    q = """SELECT p.*, e.name AS employee_name FROM payroll_runs p
+           JOIN employees e ON e.id = p.employee_id WHERE 1=1"""
+    params = []
+    if period_month:
+        q += " AND p.period_month=?"
+        params.append(period_month)
+    if employee_id is not None:
+        q += " AND p.employee_id=?"
+        params.append(employee_id)
+    q += " ORDER BY p.period_month DESC, e.name"
+    rows = conn.execute(q, params).fetchall()
     conn.close()
     return [dict(r) for r in rows]

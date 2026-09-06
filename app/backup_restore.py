@@ -133,6 +133,20 @@ _BILL_LIMITS = {
     "customer_address": validation.MAX_ADDRESS_LENGTH,
     "notes": validation.MAX_NOTES_LENGTH,
 }
+_EMPLOYEE_LIMITS = {
+    "name": validation.MAX_NAME_LENGTH,
+    "phone": validation.MAX_PHONE_LENGTH,
+    "role": 60,
+    "notes": validation.MAX_NOTES_LENGTH,
+}
+
+# Whitelists for the attendance-family enum-like columns. A backup file
+# is untrusted input like any other - without this, a hand-edited or
+# corrupt file could land a nonsense string in a column the calendar
+# grid / payroll screen switches on by exact value.
+_VALID_ATTENDANCE_STATUS = {"present", "half", "absent", "leave"}
+_VALID_PAY_TYPE = {"monthly", "daily", "shift"}
+_VALID_PAYROLL_STATUS = {"pending", "paid"}
 
 
 def open_import_source(path, password=None):
@@ -180,7 +194,7 @@ def _upper(name):
     database.py's add_customer()/create_bill()."""
     return (name or "").strip().upper()
 
-CATEGORIES = ["items", "customers", "bills", "khata", "inventory_history", "settings"]
+CATEGORIES = ["items", "customers", "bills", "khata", "inventory_history", "settings", "attendance"]
 
 CATEGORY_LABELS = {
     "items": "Items / Inventory",
@@ -189,12 +203,14 @@ CATEGORY_LABELS = {
     "khata": "Khata / Ledger (standalone entries)",
     "inventory_history": "Stock History Log",
     "settings": "Store Settings",
+    "attendance": "Employees, Attendance & Payroll",
 }
 
 _TABLE_SCHEMA_SQL = {
     "items": """CREATE TABLE items (
             id INTEGER PRIMARY KEY AUTOINCREMENT, item_code TEXT UNIQUE, name TEXT NOT NULL UNIQUE,
             category TEXT DEFAULT '', unit TEXT DEFAULT 'pcs', price REAL NOT NULL DEFAULT 0,
+            cost_price REAL NOT NULL DEFAULT 0,
             quantity REAL NOT NULL DEFAULT 0, low_stock_threshold REAL DEFAULT 5,
             pack_size REAL, pack_unit_name TEXT DEFAULT '',
             created_at TEXT, updated_at TEXT)""",
@@ -222,6 +238,27 @@ _TABLE_SCHEMA_SQL = {
             change_type TEXT NOT NULL, quantity_change REAL NOT NULL, resulting_quantity REAL,
             reference TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT)""",
     "settings": """CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)""",
+    "employees": """CREATE TABLE employees (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT DEFAULT '',
+            role TEXT DEFAULT '', pay_type TEXT NOT NULL DEFAULT 'monthly', pay_rate REAL NOT NULL DEFAULT 0,
+            joined_date TEXT, active INTEGER NOT NULL DEFAULT 1, notes TEXT DEFAULT '',
+            created_at TEXT, updated_at TEXT)""",
+    "attendance": """CREATE TABLE attendance (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER NOT NULL, date TEXT NOT NULL,
+            status TEXT NOT NULL, shifts REAL DEFAULT 1, notes TEXT DEFAULT '', marked_at TEXT,
+            UNIQUE(employee_id, date))""",
+    "employee_advances": """CREATE TABLE employee_advances (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER NOT NULL, date TEXT NOT NULL,
+            amount REAL NOT NULL, notes TEXT DEFAULT '', settled INTEGER NOT NULL DEFAULT 0,
+            payroll_id INTEGER, created_at TEXT)""",
+    "payroll_runs": """CREATE TABLE payroll_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id INTEGER NOT NULL, period_month TEXT NOT NULL,
+            present_days REAL NOT NULL DEFAULT 0, half_days REAL NOT NULL DEFAULT 0,
+            absent_days REAL NOT NULL DEFAULT 0, leave_days REAL NOT NULL DEFAULT 0,
+            gross_pay REAL NOT NULL DEFAULT 0, advances_deducted REAL NOT NULL DEFAULT 0,
+            net_pay REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'pending',
+            paid_date TEXT, notes TEXT DEFAULT '', created_at TEXT,
+            UNIQUE(employee_id, period_month))""",
 }
 
 # Which real tables each user-facing category pulls from.
@@ -232,6 +269,7 @@ _CATEGORY_TABLES = {
     "khata": ["customer_ledger"],
     "inventory_history": ["inventory_transactions"],
     "settings": ["settings"],
+    "attendance": ["employees", "attendance", "employee_advances", "payroll_runs"],
 }
 
 
@@ -294,6 +332,11 @@ def export_data(dest_path, categories):
         _copy_all(live, out, "inventory_transactions")
     if "settings" in categories:
         _copy_all(live, out, "settings")
+    if "attendance" in categories:
+        _copy_all(live, out, "employees")
+        _copy_all(live, out, "attendance")
+        _copy_all(live, out, "employee_advances")
+        _copy_all(live, out, "payroll_runs")
 
     out.commit()
     out.close()
@@ -632,6 +675,126 @@ def scan_import(src_path, categories):
             if not dup:
                 plan["inventory_history"].append({"row": dict(r)})
 
+    # Employees, attendance marks, advances and payroll runs. Bundled as
+    # one category (like "bills" bundles bill_items/customer_ledger)
+    # because they only make sense together - an attendance mark with no
+    # employee, or a payroll run for nobody, is meaningless.
+    #
+    # employee_lookup maps the BACKUP FILE's own employee row id -> that
+    # employee's (name, phone), read straight from the backup's own
+    # employees table (never from the live one). Every other row in this
+    # category references an employee only by that backup-local id, so
+    # this is what lets a mark/advance/payroll row be matched to the
+    # right LIVE employee (by name+phone, same idea as
+    # _resolve_customer_id) before that employee has necessarily been
+    # imported yet.
+    if "attendance" in categories:
+        employee_lookup = {}
+
+        if _table_exists(bak, "employees"):
+            for raw in bak.execute("SELECT * FROM employees LIMIT ?", (MAX_ROWS_PER_TABLE,)).fetchall():
+                r = _clean_row_text(dict(raw), _EMPLOYEE_LIMITS)
+                if not r.get("name"):
+                    continue                          # a nameless employee can't be matched or shown
+                if r.get("pay_type") not in _VALID_PAY_TYPE:
+                    r["pay_type"] = "monthly"
+                employee_lookup[raw["id"]] = (r["name"], r.get("phone") or "")
+                existing = live.execute(
+                    "SELECT * FROM employees WHERE UPPER(name) = ? AND phone = ?",
+                    (_upper(r["name"]), r.get("phone") or "")
+                ).fetchone()
+                if existing:
+                    c = Conflict("attendance", f"employee:{r['name']}:{r.get('phone', '')}",
+                                  f"Employee '{r['name']}' ({r.get('phone') or 'no phone'})",
+                                  dict(existing), dict(r), existing["id"])
+                    conflicts.append(c)
+                    plan["attendance"].append(
+                        {"kind": "employee", "row": r, "conflict": c, "backup_id": raw["id"]})
+                else:
+                    plan["attendance"].append(
+                        {"kind": "employee", "row": r, "conflict": None, "backup_id": raw["id"]})
+
+        if _table_exists(bak, "attendance"):
+            for raw in bak.execute("SELECT * FROM attendance LIMIT ?", (MAX_ROWS_PER_TABLE,)).fetchall():
+                r = dict(raw)
+                if r.get("status") not in _VALID_ATTENDANCE_STATUS:
+                    continue                          # garbage status - nothing sensible to import
+                emp_name, emp_phone = employee_lookup.get(r["employee_id"], (None, None))
+                entry = {"kind": "mark", "row": r, "emp_name": emp_name, "emp_phone": emp_phone,
+                          "backup_emp_id": r["employee_id"]}
+                existing_mark = None
+                if emp_name:
+                    existing_emp = live.execute(
+                        "SELECT id FROM employees WHERE UPPER(name)=? AND phone=?",
+                        (_upper(emp_name), emp_phone or "")
+                    ).fetchone()
+                    if existing_emp:
+                        existing_mark = live.execute(
+                            "SELECT * FROM attendance WHERE employee_id=? AND date=?",
+                            (existing_emp["id"], r["date"])
+                        ).fetchone()
+                if existing_mark:
+                    c = Conflict("attendance", f"mark:{emp_name}:{r['date']}",
+                                  f"{emp_name} - {r['date']} attendance",
+                                  dict(existing_mark), r, existing_mark["id"])
+                    conflicts.append(c)
+                    entry["conflict"] = c
+                else:
+                    entry["conflict"] = None
+                plan["attendance"].append(entry)
+
+        if _table_exists(bak, "employee_advances"):
+            # A cash advance is a log entry like khata/inventory history -
+            # an exact-duplicate row (same employee, date, amount, note)
+            # is skipped automatically with no prompt.
+            for raw in bak.execute("SELECT * FROM employee_advances LIMIT ?", (MAX_ROWS_PER_TABLE,)).fetchall():
+                r = dict(raw)
+                emp_name, emp_phone = employee_lookup.get(r["employee_id"], (None, None))
+                dup = None
+                if emp_name:
+                    existing_emp = live.execute(
+                        "SELECT id FROM employees WHERE UPPER(name)=? AND phone=?",
+                        (_upper(emp_name), emp_phone or "")
+                    ).fetchone()
+                    if existing_emp:
+                        dup = live.execute("""
+                            SELECT id FROM employee_advances
+                            WHERE employee_id=? AND date=? AND amount=? AND notes=?
+                        """, (existing_emp["id"], r["date"], r["amount"], r.get("notes") or "")).fetchone()
+                if not dup:
+                    plan["attendance"].append(
+                        {"kind": "advance", "row": r, "emp_name": emp_name, "emp_phone": emp_phone,
+                         "backup_emp_id": r["employee_id"]})
+
+        if _table_exists(bak, "payroll_runs"):
+            for raw in bak.execute("SELECT * FROM payroll_runs LIMIT ?", (MAX_ROWS_PER_TABLE,)).fetchall():
+                r = dict(raw)
+                if r.get("status") not in _VALID_PAYROLL_STATUS:
+                    r["status"] = "pending"
+                emp_name, emp_phone = employee_lookup.get(r["employee_id"], (None, None))
+                entry = {"kind": "payroll", "row": r, "emp_name": emp_name, "emp_phone": emp_phone,
+                          "backup_emp_id": r["employee_id"]}
+                existing_run = None
+                if emp_name:
+                    existing_emp = live.execute(
+                        "SELECT id FROM employees WHERE UPPER(name)=? AND phone=?",
+                        (_upper(emp_name), emp_phone or "")
+                    ).fetchone()
+                    if existing_emp:
+                        existing_run = live.execute(
+                            "SELECT * FROM payroll_runs WHERE employee_id=? AND period_month=?",
+                            (existing_emp["id"], r["period_month"])
+                        ).fetchone()
+                if existing_run:
+                    c = Conflict("attendance", f"payroll:{emp_name}:{r['period_month']}",
+                                  f"{emp_name} - {r['period_month']} payroll ({r['status']})",
+                                  dict(existing_run), r, existing_run["id"])
+                    conflicts.append(c)
+                    entry["conflict"] = c
+                else:
+                    entry["conflict"] = None
+                plan["attendance"].append(entry)
+
     live.close()
     bak.close()
     return plan, conflicts
@@ -679,6 +842,52 @@ def _get_or_create_customer_id(cur, backup_id, name, phone, address, customer_id
                 (name, phone, _upper(address), "Auto-created from an imported bill", db.now_str()))
     new_id = cur.lastrowid
     customer_id_map[backup_id] = new_id
+    return new_id
+
+
+def _resolve_employee_id(cur, backup_id, name, phone, employee_id_map):
+    """Same idea as _resolve_customer_id, but for the employee an
+    attendance/advance/payroll row belongs to. `backup_id` is the raw
+    employee_id from the BACKUP FILE's own attendance-family table -
+    never trusted directly, only used as a key into employee_id_map
+    (populated while this same import processes the "employee" plan
+    entries) or, failing that, resolved live by name+phone."""
+    if backup_id in employee_id_map:
+        return employee_id_map[backup_id]
+    name = (name or "").strip()
+    if not name:
+        return None
+    row = cur.execute("SELECT id FROM employees WHERE UPPER(name)=? AND phone=?",
+                       (name.upper(), phone or "")).fetchone()
+    return row["id"] if row else None
+
+
+def _get_or_create_employee_id(cur, backup_id, name, phone, employee_id_map):
+    """Like _resolve_employee_id(), but creates a minimal employee record
+    instead of leaving the row orphaned when no match exists - mirrors
+    _get_or_create_customer_id() for bills. In practice this only fires
+    for an older/hand-trimmed backup that carries attendance data but no
+    employees table (or a row whose employee was itself skipped and
+    never matched anything live), since a normal "attendance" category
+    backup always carries its employees alongside."""
+    if backup_id in employee_id_map:
+        return employee_id_map[backup_id]
+    name = (name or "").strip()
+    if not name:
+        return None
+    phone = phone or ""
+    row = cur.execute("SELECT id FROM employees WHERE UPPER(name)=? AND phone=?",
+                       (name.upper(), phone)).fetchone()
+    if row:
+        employee_id_map[backup_id] = row["id"]
+        return row["id"]
+    cur.execute("""INSERT INTO employees (name, phone, role, pay_type, pay_rate, joined_date,
+                    active, notes, created_at, updated_at)
+                    VALUES (?,?,?,?,?,?,1,?,?,?)""",
+                (name, phone, "", "monthly", 0, db.now_str()[:10],
+                 "Auto-created from imported attendance data", db.now_str(), db.now_str()))
+    new_id = cur.lastrowid
+    employee_id_map[backup_id] = new_id
     return new_id
 
 
@@ -735,6 +944,7 @@ def _apply_import_inner(conn, plan):
 
     item_id_map = {}      # backup item id -> live item id (only for items in THIS backup's import)
     customer_id_map = {}  # backup customer id -> live customer id (only for customers in THIS backup's import)
+    employee_id_map = {}  # backup employee id -> live employee id (only for employees in THIS backup's import)
 
     # Items first (bills/inventory history reference them)
     for entry in plan["items"]:
@@ -745,19 +955,27 @@ def _apply_import_inner(conn, plan):
         # error.
         pack_size = row.get("pack_size")
         pack_unit_name = row.get("pack_unit_name") or ""
+        # .get() with a 0 default: an older backup made before cost_price
+        # existed simply won't have this column at all - treat that as
+        # "no cost recorded yet", not an error. Owner-only data, but
+        # gating who is even ALLOWED to reach this import path at all is
+        # already handled by PERM_IMPORT_DATA at the bridge.py layer (see
+        # its own comment) - by the time a row gets here it is fine to
+        # carry cost_price straight through, same as price.
+        cost_price = row.get("cost_price") or 0
         if conflict is None:
-            cur.execute("""INSERT INTO items (item_code, name, category, unit, price, quantity,
+            cur.execute("""INSERT INTO items (item_code, name, category, unit, price, cost_price, quantity,
                             low_stock_threshold, pack_size, pack_unit_name, created_at, updated_at)
-                            VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                        (row["item_code"], row["name"], row["category"], row["unit"], row["price"],
+                            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (row["item_code"], row["name"], row["category"], row["unit"], row["price"], cost_price,
                          row["quantity"], row["low_stock_threshold"], pack_size, pack_unit_name,
                          row["created_at"], row["updated_at"]))
             item_id_map[row["id"]] = cur.lastrowid
             summary["items"]["added"] += 1
         elif conflict.resolution == "overwrite":
-            cur.execute("""UPDATE items SET item_code=?, category=?, unit=?, price=?, quantity=?,
+            cur.execute("""UPDATE items SET item_code=?, category=?, unit=?, price=?, cost_price=?, quantity=?,
                             low_stock_threshold=?, pack_size=?, pack_unit_name=?, updated_at=? WHERE id=?""",
-                        (row["item_code"], row["category"], row["unit"], row["price"], row["quantity"],
+                        (row["item_code"], row["category"], row["unit"], row["price"], cost_price, row["quantity"],
                          row["low_stock_threshold"], pack_size, pack_unit_name, db.now_str(), conflict.existing_id))
             item_id_map[row["id"]] = conflict.existing_id
             summary["items"]["updated"] += 1
@@ -919,6 +1137,109 @@ def _apply_import_inner(conn, plan):
                     (new_item_id, row["item_name"], row["change_type"], row["quantity_change"],
                      row["resulting_quantity"], row["reference"], row["notes"], row["created_at"]))
         summary["inventory_history"]["added"] += 1
+
+    # Employees, attendance marks, advances and payroll runs. Processed
+    # in the order scan_import() built plan["attendance"] in - every
+    # "employee" entry before any "mark"/"advance"/"payroll" entry - so
+    # employee_id_map is already populated with this run's employees by
+    # the time anything needs to resolve one.
+    for entry in plan["attendance"]:
+        kind = entry["kind"]
+
+        if kind == "employee":
+            row, conflict = entry["row"], entry["conflict"]
+            if conflict is None:
+                cur.execute("""INSERT INTO employees (name, phone, role, pay_type, pay_rate, joined_date,
+                                active, notes, created_at, updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                            (row["name"], row.get("phone") or "", row.get("role") or "",
+                             row.get("pay_type") or "monthly", row.get("pay_rate") or 0,
+                             row.get("joined_date"), row.get("active", 1), row.get("notes") or "",
+                             row.get("created_at"), row.get("updated_at")))
+                employee_id_map[entry["backup_id"]] = cur.lastrowid
+                summary["attendance"]["added"] += 1
+            elif conflict.resolution == "overwrite":
+                cur.execute("""UPDATE employees SET role=?, pay_type=?, pay_rate=?, joined_date=?,
+                                notes=?, updated_at=? WHERE id=?""",
+                            (row.get("role") or "", row.get("pay_type") or "monthly",
+                             row.get("pay_rate") or 0, row.get("joined_date"), row.get("notes") or "",
+                             db.now_str(), conflict.existing_id))
+                employee_id_map[entry["backup_id"]] = conflict.existing_id
+                summary["attendance"]["updated"] += 1
+            else:
+                employee_id_map[entry["backup_id"]] = conflict.existing_id
+                summary["attendance"]["skipped"] += 1
+            continue
+
+        if kind == "mark":
+            row, conflict = entry["row"], entry["conflict"]
+            if conflict is not None and conflict.resolution == "skip":
+                summary["attendance"]["skipped"] += 1
+                continue
+            new_emp_id = _get_or_create_employee_id(cur, entry["backup_emp_id"], entry.get("emp_name"),
+                                                      entry.get("emp_phone"), employee_id_map)
+            if new_emp_id is None:
+                summary["attendance"]["skipped"] += 1
+                continue
+            if conflict is not None and conflict.resolution == "overwrite":
+                cur.execute("UPDATE attendance SET status=?, shifts=?, notes=?, marked_at=? WHERE id=?",
+                            (row["status"], row.get("shifts") or 1, row.get("notes") or "",
+                             row.get("marked_at"), conflict.existing_id))
+                summary["attendance"]["updated"] += 1
+            else:
+                cur.execute("""INSERT OR IGNORE INTO attendance (employee_id, date, status, shifts, notes,
+                                marked_at) VALUES (?,?,?,?,?,?)""",
+                            (new_emp_id, row["date"], row["status"], row.get("shifts") or 1,
+                             row.get("notes") or "", row.get("marked_at")))
+                summary["attendance"]["added"] += 1
+            continue
+
+        if kind == "advance":
+            row = entry["row"]
+            new_emp_id = _get_or_create_employee_id(cur, entry["backup_emp_id"], entry.get("emp_name"),
+                                                      entry.get("emp_phone"), employee_id_map)
+            if new_emp_id is None:
+                summary["attendance"]["skipped"] += 1
+                continue
+            # Always imported as outstanding (settled=0, no payroll_id) -
+            # a backup's raw payroll_id is a row id from another database
+            # and almost certainly does not point at anything real here;
+            # see _get_or_create_employee_id's docstring for the same
+            # reasoning applied to raw ids in general.
+            cur.execute("""INSERT INTO employee_advances (employee_id, date, amount, notes, settled,
+                            payroll_id, created_at) VALUES (?,?,?,?,0,NULL,?)""",
+                        (new_emp_id, row["date"], row["amount"], row.get("notes") or "",
+                         row.get("created_at")))
+            summary["attendance"]["added"] += 1
+            continue
+
+        if kind == "payroll":
+            row, conflict = entry["row"], entry["conflict"]
+            if conflict is not None and conflict.resolution == "skip":
+                summary["attendance"]["skipped"] += 1
+                continue
+            new_emp_id = _get_or_create_employee_id(cur, entry["backup_emp_id"], entry.get("emp_name"),
+                                                      entry.get("emp_phone"), employee_id_map)
+            if new_emp_id is None:
+                summary["attendance"]["skipped"] += 1
+                continue
+            if conflict is not None and conflict.resolution == "overwrite":
+                cur.execute("""UPDATE payroll_runs SET present_days=?, half_days=?, absent_days=?,
+                                leave_days=?, gross_pay=?, advances_deducted=?, net_pay=?, status=?,
+                                paid_date=?, notes=? WHERE id=?""",
+                            (row["present_days"], row["half_days"], row["absent_days"], row["leave_days"],
+                             row["gross_pay"], row["advances_deducted"], row["net_pay"], row["status"],
+                             row.get("paid_date"), row.get("notes") or "", conflict.existing_id))
+                summary["attendance"]["updated"] += 1
+            else:
+                cur.execute("""INSERT INTO payroll_runs (employee_id, period_month, present_days, half_days,
+                                absent_days, leave_days, gross_pay, advances_deducted, net_pay, status,
+                                paid_date, notes, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                            (new_emp_id, row["period_month"], row["present_days"], row["half_days"],
+                             row["absent_days"], row["leave_days"], row["gross_pay"],
+                             row["advances_deducted"], row["net_pay"], row["status"],
+                             row.get("paid_date"), row.get("notes") or "", row.get("created_at")))
+                summary["attendance"]["added"] += 1
+            continue
 
     conn.commit()
     conn.close()

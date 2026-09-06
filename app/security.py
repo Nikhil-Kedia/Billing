@@ -146,6 +146,13 @@ PERM_MANAGE_USERS = "manage_users"
 PERM_VIEW_AUDIT_LOG = "view_audit_log"
 PERM_CLEAR_STOCK_HISTORY = "clear_stock_history"
 PERM_LEDGER_PAYMENT = "ledger_payment"
+# Owner-only by design, not just by default - neither of these is ever
+# added to _STAFF_PERMISSIONS below, because the owner asked for this
+# data ("not printed on the final PDF ... only viewed by the owner") to
+# be off-limits to staff, not merely hidden behind a toggle they could
+# later be granted.
+PERM_VIEW_PROFIT = "view_profit"
+PERM_MANAGE_ATTENDANCE = "manage_attendance"
 
 # Owner gets everything by definition (see has_permission), so only the
 # Staff grant list needs writing out. Staff can run the shop counter:
@@ -173,6 +180,8 @@ PERMISSION_LABELS = {
     PERM_VIEW_AUDIT_LOG: "view the activity log",
     PERM_CLEAR_STOCK_HISTORY: "clear the stock history log",
     PERM_LEDGER_PAYMENT: "record a khata payment",
+    PERM_VIEW_PROFIT: "view profit and cost price",
+    PERM_MANAGE_ATTENDANCE: "manage employee attendance and payroll",
 }
 
 

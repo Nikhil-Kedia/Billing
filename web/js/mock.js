@@ -33,6 +33,7 @@ const items = NAMES.map((name, i) => {
     category: pick(CATS),
     unit: pick(UNITS),
     price,
+    cost_price: Math.round(price * (0.6 + rnd() * 0.25) * 100) / 100,
     quantity: Math.floor(rnd() * 140) - (rnd() > .85 ? 8 : 0),
     low_stock_threshold: 10,
     pack_size: packed ? pick([6, 10, 12, 24, 48]) : null,
@@ -89,12 +90,25 @@ const balanceOf = (id) => { const l = ledger[id] || []; return l.length ? l[l.le
 const sum = (a) => a.reduce((s, x) => s + x, 0);
 const ok = (data) => ({ ok: true, data });
 
+// Employee attendance & payroll mock store.
+const mockEmployees = [];
+const mockAttendance = {};
+let mockAdvances = [];
+let mockEmpSeq = 0, mockAdvSeq = 0, mockPayrollSeq = 0;
+
 export const mockApi = {
   bootstrap: async () => ok({
     settings: { store_name: 'Balaji Store', store_contact: '+91 94370 12345',
                 store_address: 'Main Road, Balangir, Odisha 767001', bill_prefix: 'BS' },
     user: { id: 1, username: 'balaji', display_name: 'Balaji', role: 'owner' },
     track_stock: true, track_khata: true,
+    // The mock always plays "signed in as the owner", so browser-preview
+    // shows every screen including the owner-only ones.
+    can: { view_profit: true, manage_attendance: true, delete_bill: true, delete_all_bills: true,
+           edit_bill: true, manage_inventory: true, reset_inventory: true, delete_customer: true,
+           view_analytics: true, manage_settings: true, backup_data: true, import_data: true,
+           archive_bills: true, manage_users: true, view_audit_log: true, clear_stock_history: true,
+           ledger_payment: true },
     app: { name: 'Vikray', version: '3.0' }, data_dir: 'C:\\Users\\…\\BalajiBilling\\data',
   }),
 
@@ -369,6 +383,42 @@ export const mockApi = {
   get_update_progress: async () => ok({ downloading: false, downloaded: 0, total: 0, ready: false, error: null }),
   install_update: async () => ok(true),
   dismiss_update_notice: async () => ok(true),
+
+  // Employee attendance & payroll (owner-only) - a small, self-contained
+  // mock store so the screen has something to show in browser preview.
+  employees_list: async () => ok(mockEmployees),
+  add_employee: async (data) => { const id = ++mockEmpSeq; mockEmployees.push({ id, active: 1, ...data }); return ok(id); },
+  update_employee: async (id, data) => { const e = mockEmployees.find(x => x.id === id); if (e) Object.assign(e, data); return ok(true); },
+  set_employee_active: async (id, active) => { const e = mockEmployees.find(x => x.id === id); if (e) e.active = active ? 1 : 0; return ok(true); },
+  attendance_month: async (month) => ok(mockAttendance[month] || {}),
+  mark_attendance: async (employeeId, date, status, shifts) => {
+    const m = date.slice(0, 7);
+    mockAttendance[m] = mockAttendance[m] || {};
+    mockAttendance[m][employeeId] = mockAttendance[m][employeeId] || {};
+    if (status === 'clear') delete mockAttendance[m][employeeId][date];
+    else mockAttendance[m][employeeId][date] = { status, shifts: shifts ?? 1 };
+    return ok(true);
+  },
+  add_advance: async (employeeId, date, amount, notes) => {
+    const id = ++mockAdvSeq;
+    mockAdvances.push({ id, employee_id: employeeId, date, amount, notes: notes || '', settled: 0 });
+    return ok(id);
+  },
+  list_advances: async (employeeId, unsettledOnly) => ok(mockAdvances.filter(a =>
+    (employeeId == null || a.employee_id === employeeId) && (!unsettledOnly || !a.settled))),
+  delete_advance: async (id) => { mockAdvances = mockAdvances.filter(a => a.id !== id || a.settled); return ok(true); },
+  payroll_preview: async (employeeId, month) => {
+    const emp = mockEmployees.find(e => e.id === employeeId);
+    return ok(emp ? {
+      employee_id: employeeId, employee_name: emp.name, period_month: month,
+      pay_type: emp.pay_type, pay_rate: emp.pay_rate, days_in_month: 30,
+      present_days: 0, half_days: 0, absent_days: 0, leave_days: 0, shifts_total: 0,
+      gross_pay: 0, advances_deducted: 0, advance_ids: [], net_pay: 0,
+    } : null);
+  },
+  finalize_payroll: async () => ok(++mockPayrollSeq),
+  mark_payroll_paid: async () => ok(true),
+  payroll_runs: async () => ok([]),
 };
 
 // The real bridge exposes a couple of methods under two names, because the

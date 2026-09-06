@@ -69,7 +69,7 @@ function paint(root) {
           <div class="panel grow">
             <div class="row gap3" style="padding:12px 14px;align-items:flex-end">
               <div class="field grow" style="max-width:280px">
-                <label class="label">Customer<span class="req">*</span></label>
+                <label class="label" id="lblCustomer">Customer<span class="req">*</span></label>
                 <input class="input" id="f-name" autocomplete="off" placeholder="Start typing a name…">
               </div>
               <div class="field" style="width:150px">
@@ -294,36 +294,56 @@ const validRow = (r) => {
   return r.name.value.trim() && isFinite(qv) && qv > 0 && isFinite(pv);
 };
 
-/* ---------- pack ↔ quantity, and the red remainder star ---------- */
-function setPack(r, size, unitName) {
-  r.packSize = size ? Number(size) : null;
-  r.packUnit = unitName || '';
-  const usable = !!(r.packSize && r.packUnit);
+/* ---------- pack ↔ quantity, and the red remainder star ----------
+   Most items in a real inventory never get a "Pack size" configured in
+   Inventory (of 413 real items here, exactly one has it set) - but a
+   wholesaler still buys everything by the carton or box, configured or
+   not. So a real, configured pack (packSize + packUnit both set) works
+   exactly as before everywhere; on a PURCHASE bill specifically, an item
+   with no configured pack still gets a *usable* Pack column, standing in
+   at 1 pack = 1 base unit until someone sets the item's real pack size.
+   Sale bills are unaffected - Pack stays disabled there without a real
+   configured pack, exactly like before. */
+function effPackSize(r) {
+  return r.packSize || (S.billType === 'purchase' ? 1 : null);
+}
+
+function refreshPackUsable(r) {
+  const hasRealPack = !!(r.packSize && r.packUnit);
+  const usable = hasRealPack || S.billType === 'purchase';
   r.pack.disabled = !usable;
-  r.pack.placeholder = usable ? r.packUnit : '—';
+  r.pack.placeholder = hasRealPack ? r.packUnit : (usable ? 'packs' : '—');
   if (!usable) { r.pack.value = ''; r.star.textContent = ''; }
   else syncPackFromQty(r);
 }
 
+function setPack(r, size, unitName) {
+  r.packSize = size ? Number(size) : null;
+  r.packUnit = unitName || '';
+  refreshPackUsable(r);
+}
+
 function syncPackFromQty(r) {
-  if (r._sync || !r.packSize || !r.packUnit) return;
+  const size = effPackSize(r);
+  if (r._sync || !size) return;
   const v = num(r.qtyEl.value, NaN);
   if (!isFinite(v) || v < 0) { r.star.textContent = ''; return; }
   r._sync = true;
-  const whole = Math.floor(v / r.packSize);
-  const rem = v - whole * r.packSize;
+  const whole = Math.floor(v / size);
+  const rem = v - whole * size;
   r.pack.value = whole ? String(whole) : '';
   r.star.textContent = Math.abs(rem) > 1e-9 ? '*' : '';
-  r.star.title = r.star.textContent ? `${fmtQty(rem)} loose beyond ${whole} × ${r.packUnit}` : '';
+  r.star.title = r.star.textContent ? `${fmtQty(rem)} loose beyond ${whole} × ${r.packUnit || 'pack'}` : '';
   r._sync = false;
 }
 
 function onPackTyped(r) {
-  if (r._sync || !r.packSize) return;
+  const size = effPackSize(r);
+  if (r._sync || !size) return;
   const p = num(r.pack.value, NaN);
   if (!isFinite(p) || p < 0) return;
   r._sync = true;
-  r.qtyEl.value = String(+(p * r.packSize).toFixed(3));
+  r.qtyEl.value = String(+(p * size).toFixed(3));
   r.star.textContent = '';
   r._sync = false;
   recalc();
@@ -341,6 +361,17 @@ function applyItem(r, it, { setQtyOne = false } = {}) {
   recalc();
 }
 
+/** Where focus lands right after an item code resolves (typed exact
+    match, or picked from the code suggestions) - Quantity on a sale,
+    Pack on a purchase (see refreshPackUsable() above: Pack is always
+    usable on a purchase, configured pack size or not). Kept in one
+    place so the Enter-key flow (enterKey(), below) and picking a
+    suggestion by click never disagree with each other. */
+function focusAfterCode(r) {
+  if (S.billType === 'purchase' && !r.pack.disabled) focusCell(r.pack);
+  else focusCell(r.qtyEl);
+}
+
 function onCodeTyped(r) {
   const t = r.code.value.trim().toLowerCase();
   if (!t) { AC.closeAC(); return; }
@@ -348,7 +379,7 @@ function onCodeTyped(r) {
   if (exact) { AC.closeAC(); applyItem(r, exact, { setQtyOne: true }); return; }
   const hits = S.items.filter(i => String(i.item_code || '').toLowerCase().includes(t)).slice(0, MAX_SUGGEST);
   AC.show(r.code, hits.map(i => ({ label: i.item_code, sub: i.name, value: i })),
-    (it) => { applyItem(r, it, { setQtyOne: true }); r.qtyEl.focus(); }, t);
+    (it) => { applyItem(r, it, { setQtyOne: true }); focusAfterCode(r); }, t);
 }
 
 function onNameTyped(r) {
@@ -519,8 +550,10 @@ function enterKey(node_) {
   if (node_ === S.saveBtn) { save(); return true; }
 
   // Item code jumps straight to quantity — the fast counter flow.
+  // In Purchase mode it jumps to Pack instead, when the item has one
+  // configured: purchases are bought by the carton/box, not the piece.
   const row = S.rows.find(x => x.code === node_);
-  if (row) { focusCell(row.qtyEl); return true; }
+  if (row) { focusAfterCode(row); return true; }
 
   // Adjustment fields behave like Down.
   if ([S.f.add, S.f.less, S.f.notes, S.f.paid].includes(node_)) return arrow(node_, 1, 0);
@@ -566,6 +599,9 @@ function wire() {
     S.billType = b.dataset.t;
     const purchase = S.billType === 'purchase';
     q('#saveBtn', root).innerHTML = `${icon('print', 16)}Save ${purchase ? 'purchase' : '&amp; Print'}`;
+    q('#lblCustomer', root).innerHTML = purchase ? 'Party Name<span class="req">*</span>' : 'Customer<span class="req">*</span>';
+    q('#f-name', root).placeholder = purchase ? 'Start typing a supplier…' : 'Start typing a name…';
+    S.rows.forEach(refreshPackUsable);
   });
   on(q('#payType', root), 'click', 'button', (e, b) => {
     qa('#payType button', root).forEach(x => x.classList.toggle('on', x === b));
@@ -776,6 +812,9 @@ function preload(bill) {
   S.custId = bill.customer_id || null;
   S.billType = bill.bill_type || 'sale';
   qa('#billType button', S.root).forEach(b => b.classList.toggle('on', b.dataset.t === S.billType));
+  { const purchase = S.billType === 'purchase';
+    q('#lblCustomer', S.root).innerHTML = purchase ? 'Party Name<span class="req">*</span>' : 'Customer<span class="req">*</span>';
+    q('#f-name', S.root).placeholder = purchase ? 'Start typing a supplier…' : 'Start typing a name…'; }
   q('#billNo', S.root).textContent = bill.bill_number || '—';
   (bill.items || []).forEach(li => addRow({
     ...li,

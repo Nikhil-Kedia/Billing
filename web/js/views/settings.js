@@ -141,6 +141,7 @@ function toggleRow(key, label, desc, isOn) {
 /* ============================ Business profile ============================ */
 function sectionProfile() {
   const s = S.settings, owner = isOwner();
+  const gstOn = s.show_gstin === '1' || s.show_gstin === 1;
   return `
     <div class="panel-head"><div class="h2 grow">Business profile</div></div>
     <div class="col gap4" style="padding:18px 20px;max-width:560px">
@@ -158,6 +159,11 @@ function sectionProfile() {
         <textarea class="input" id="p-addr" rows="2" ${owner ? '' : 'disabled'} placeholder="Shop address, town, district">${esc(s.store_address || '')}</textarea>
       </div>
       <div class="field">
+        <label class="label">GSTIN</label>
+        <input class="input mono" id="p-gstin" value="${esc(s.store_gstin || '')}" ${owner ? '' : 'disabled'} placeholder="22AAAAA0000A1Z5" maxlength="15" style="text-transform:uppercase">
+        <div class="tiny muted">Saved either way — the toggle below controls whether it actually prints on the bill.</div>
+      </div>
+      <div class="field">
         <label class="label">Logo path</label>
         <input class="input mono" id="p-logo" value="${esc(s.logo_path || '')}" ${owner ? '' : 'disabled'} placeholder="C:\\path\\to\\logo.png">
         <div class="tiny muted">Path to a PNG or JPG on this computer. Leave blank to print bills without a logo.</div>
@@ -165,6 +171,8 @@ function sectionProfile() {
       <div class="row gap3" style="margin-top:4px">
         <button class="btn btn-primary ${owner ? '' : 'is-disabled'}" id="saveProfile" ${owner ? '' : 'title="Only the store owner can change settings"'}>${icon('save', 15)}Save changes</button>
       </div>
+      <div class="divider"></div>
+      ${toggleRow('show_gstin', 'Print GSTIN on bills', 'Adds the GSTIN above to the header of every bill PDF.', gstOn)}
     </div>`;
 }
 
@@ -175,6 +183,7 @@ async function saveProfile() {
   const name = q('#p-name', host).value.trim() || 'Balaji Store';
   const phone = q('#p-phone', host).value.trim();
   const addr = q('#p-addr', host).value.trim();
+  const gstin = q('#p-gstin', host).value.trim().toUpperCase();
   const logo = q('#p-logo', host).value.trim();
   const orig = btn.innerHTML;
   btn.classList.add('is-disabled');
@@ -184,9 +193,10 @@ async function saveProfile() {
       api.set_setting('store_name', name),
       api.set_setting('store_contact', phone),
       api.set_setting('store_address', addr),
+      api.set_setting('store_gstin', gstin),
       api.set_setting('logo_path', logo),
     ]);
-    Object.assign(S.settings, { store_name: name, store_contact: phone, store_address: addr, logo_path: logo });
+    Object.assign(S.settings, { store_name: name, store_contact: phone, store_address: addr, store_gstin: gstin, logo_path: logo });
     toast('Saved', 'Business profile updated.', 'ok');
   } catch (e) {
     toast('Could not save', e.message, 'bad');

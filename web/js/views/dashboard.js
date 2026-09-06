@@ -44,6 +44,9 @@ const TILE_DEF = {
   revenue:     { icon: 'rupee', label: () => `${rangeLabel(S.range)} Revenue` },
   bills:       { icon: 'book', label: () => 'Bills' },
   avg:         { icon: 'chart', label: () => 'Average Bill' },
+  // Owner-only tile - see kpiKeys(). Never shown, never fetched, for a
+  // staff account (bridge.py's dashboard() omits kpis.profit entirely).
+  profit:      { icon: 'chart', label: () => `${rangeLabel(S.range)} Profit` },
   outstanding: { icon: 'card', label: () => 'Outstanding Dues' },
   low_stock:   { icon: 'box', label: () => 'Low Stock' },
 };
@@ -52,6 +55,7 @@ const TONE = {
   revenue: () => 'primary',
   bills: () => 'neutral',
   avg: () => 'neutral',
+  profit: (k) => (k.profit || 0) < 0 ? 'danger' : 'success',
   outstanding: (k) => (k.outstanding || 0) > 0.009 ? 'danger' : 'success',
   low_stock: (k) => (k.low_stock || 0) > 0 ? 'warning' : 'success',
 };
@@ -396,6 +400,7 @@ function wireResize() {
 /* ============================ KPI tiles ============================ */
 function kpiKeys() {
   const keys = ['revenue', 'bills', 'avg'];
+  if (S.ctx.app.can.view_profit) keys.push('profit');
   if (S.ctx.app.flags.khata) keys.push('outstanding');
   if (S.ctx.app.flags.stock) keys.push('low_stock');
   return keys;
@@ -445,6 +450,7 @@ function hintText(key, k) {
     case 'revenue': return deltaSentence(k.revenue_delta) || 'first period on record';
     case 'bills': return deltaSentence(k.bills_delta) || 'first period on record';
     case 'avg': return k.avg ? (deltaSentence(k.avg_delta) || 'first period on record') : 'no bills yet';
+    case 'profit': return deltaSentence(k.profit_delta) || 'first period on record';
     case 'outstanding': return (k.outstanding || 0) > 0.009
       ? `across ${k.outstanding_accounts || 0} khata${k.outstanding_accounts === 1 ? '' : 's'}` : 'all settled';
     case 'low_stock': return (k.low_stock || 0) > 0 ? 'need restocking' : 'all stocked';
@@ -476,6 +482,7 @@ function tileHTML(key, i, k, sd) {
     case 'revenue': value = inrShort(k.revenue || 0); deltaPct = k.revenue_delta; series = sd.rev; break;
     case 'bills': value = String(k.bills ?? 0); deltaPct = k.bills_delta; series = sd.bills; break;
     case 'avg': value = k.avg ? inrShort(k.avg) : '—'; deltaPct = k.avg ? k.avg_delta : null; series = sd.avg; break;
+    case 'profit': value = inrShort(k.profit || 0); deltaPct = k.profit_delta; series = sd.profit; break;
     case 'outstanding': value = inrShort(k.outstanding || 0); series = sd.ageing; break;
     case 'low_stock': value = String(k.low_stock ?? 0); series = sd.flat; break;
   }
@@ -517,6 +524,7 @@ function renderKPIs(data) {
     rev: daily.map(d => d.revenue),
     bills: daily.map(d => d.bills),
     avg: daily.map(d => d.bills ? d.revenue / d.bills : 0),
+    profit: daily.map(d => d.profit || 0),
     ageing: (data.ageing || []).slice().reverse().map(a => a.amount),
     flat: [k.low_stock || 0, k.low_stock || 0],
   };
@@ -847,7 +855,7 @@ const XR_KIND_HINT = {
   cycle: "Donut isn't offered here — it would lose the natural order of the days or hours.",
   cat: "Line and area aren't offered here — they'd imply an order between categories that isn't there.",
 };
-const XR_MONEY_Y = new Set(['revenue', 'avg_bill', 'collected', 'outstanding']);
+const XR_MONEY_Y = new Set(['revenue', 'avg_bill', 'collected', 'outstanding', 'profit']);
 const XR_TOPN_X = new Set(['customer', 'product', 'category']);
 const XR_DONUT_PALETTE = ['var(--accent)', 'var(--info)', 'var(--ok)', 'var(--warn)', 'var(--bad)',
   'var(--accent-ink)', 'var(--info-ink)', 'var(--ok-ink)', 'var(--warn-ink)', 'var(--bad-ink)'];
@@ -879,8 +887,9 @@ function initCustomChart() {
   };
   const xr = S.xr, e = xr.el;
 
+  const yOptions = S.ctx.app.can.view_profit ? XR_Y.concat([{ key: 'profit', label: 'Profit' }]) : XR_Y;
   e.x.innerHTML = XR_X.map(o => `<option value="${o.key}">${esc(o.label)}</option>`).join('');
-  e.y.innerHTML = XR_Y.map(o => `<option value="${o.key}">${esc(o.label)}</option>`).join('');
+  e.y.innerHTML = yOptions.map(o => `<option value="${o.key}">${esc(o.label)}</option>`).join('');
   e.x.value = xr.x; e.y.value = xr.y;
   xrPopulateChartOptions();
   xrRefreshLimitVisibility();

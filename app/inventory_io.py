@@ -47,6 +47,7 @@ COLUMNS = [
     ("category", "Category"),
     ("unit", "Unit"),
     ("price", "Price"),
+    ("cost_price", "Cost Price"),
     ("quantity", "Stock Qty"),
     ("low_stock_threshold", "Low Stock Alert At"),
     ("pack_size", "Pack Size"),
@@ -65,6 +66,7 @@ ALIASES = {
     "category": {"category", "group", "type"},
     "unit": {"unit", "uom", "units"},
     "price": {"price", "rate", "mrp", "selling price", "price/unit"},
+    "cost_price": {"cost_price", "cost price", "cost", "purchase price", "buy price"},
     "quantity": {"quantity", "qty", "stock", "stock qty", "current stock"},
     "low_stock_threshold": {"low_stock_threshold", "low stock alert at",
                             "low stock", "reorder level", "alert at"},
@@ -206,6 +208,8 @@ def _clean_row(raw, mapping, line_no):
         "unit": validation.unit(_cell(raw, mapping, "unit")) or "pcs",
         "price": validation.money(_cell(raw, mapping, "price") or 0,
                                   f"Price for '{name}'"),
+        "cost_price": validation.money(_cell(raw, mapping, "cost_price") or 0,
+                                       f"Cost price for '{name}'"),
         "quantity": validation.quantity(_cell(raw, mapping, "quantity") or 0,
                                         f"Stock for '{name}'", allow_zero=True),
         "low_stock_threshold": validation.quantity(
@@ -326,7 +330,8 @@ def apply(plan):
                 category=row["category"], unit=row["unit"], price=row["price"],
                 quantity=row["quantity"],
                 low_stock_threshold=row["low_stock_threshold"],
-                pack_size=row["pack_size"], pack_unit_name=row["pack_unit_name"])
+                pack_size=row["pack_size"], pack_unit_name=row["pack_unit_name"],
+                cost_price=row["cost_price"])
             counts["added"] += 1
         elif conflict.resolution == "overwrite":
             existing = dict(conflict.existing_row)
@@ -341,7 +346,8 @@ def apply(plan):
                 # with a stale column is not recoverable.
                 quantity=existing.get("quantity", 0),
                 low_stock_threshold=row["low_stock_threshold"],
-                pack_size=row["pack_size"], pack_unit_name=row["pack_unit_name"])
+                pack_size=row["pack_size"], pack_unit_name=row["pack_unit_name"],
+                cost_price=row["cost_price"])
             counts["updated"] += 1
         else:
             counts["skipped"] += 1

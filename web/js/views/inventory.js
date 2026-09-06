@@ -145,6 +145,7 @@ function comparator({ key, dir }) {
       case 'name':     r = String(a.name || '').localeCompare(String(b.name || '')); break;
       case 'category': r = String(a.category || '').localeCompare(String(b.category || '')); break;
       case 'price':    r = (a.price || 0) - (b.price || 0); break;
+      case 'cost':     r = (a.cost_price || 0) - (b.cost_price || 0); break;
       case 'stock':    r = (a.quantity || 0) - (b.quantity || 0); break;
       case 'unit':     r = String(a.unit || '').localeCompare(String(b.unit || '')); break;
       default: r = 0;
@@ -247,6 +248,7 @@ const COLS = () => {
     { key: 'name', label: 'Product', grow: true, sort: true },
     { key: 'category', label: 'Category', width: 132, sort: true },
     { key: 'price', label: 'Price', width: 116, sort: true, right: true },
+    ...(S.ctx.app.can.view_profit ? [{ key: 'cost', label: 'Cost', width: 116, sort: true, right: true }] : []),
     ...(stockOn ? [{ key: 'stock', label: 'Stock', width: 160, sort: true }] : []),
     ...(stockOn ? [{ key: 'status', label: 'Status', width: 104, center: true }] : []),
     { key: 'unit', label: 'Unit', width: 64, center: true },
@@ -300,6 +302,7 @@ function rowHtml(it) {
     <div class="grow ellipsis strong">${esc(it.name)}</div>
     <div class="ellipsis" style="width:132px">${esc(it.category || '—')}</div>
     <div class="num-cell mono" style="width:116px">${inr(it.price)}</div>
+    ${S.ctx.app.can.view_profit ? `<div class="num-cell mono" style="width:116px">${inr(it.cost_price)}</div>` : ''}
     ${stockOn ? `<div style="width:160px">
       <div class="stock-bar">
         <div class="bar"><i style="width:${pct}%;background:${barColor}"></i></div>
@@ -402,7 +405,7 @@ function setErr(body, id, msg) {
 
 function readItemForm(body, isEdit) {
   const val = (id) => (q('#' + id, body)?.value ?? '').trim();
-  ['f-code', 'f-name', 'f-cat', 'f-unit', 'f-psize', 'f-punit', 'f-price', 'f-qty', 'f-thresh']
+  ['f-code', 'f-name', 'f-cat', 'f-unit', 'f-psize', 'f-punit', 'f-price', 'f-cost', 'f-qty', 'f-thresh']
     .forEach(id => setErr(body, id, ''));
 
   let ok = true;
@@ -419,6 +422,16 @@ function readItemForm(body, isEdit) {
   const price = num(val('f-price'), NaN);
   if (!isFinite(price) || price < 0) { setErr(body, 'f-price', 'Enter a valid price of 0 or more.'); ok = false; }
   else if (price > 1e8) { setErr(body, 'f-price', 'That looks too large — check for an extra digit.'); ok = false; }
+
+  // Cost price only exists in the form for an owner (see openItemModal) -
+  // a staff account never sees or sends this field at all.
+  const hasCost = !!q('#f-cost', body);
+  let costPrice = null;
+  if (hasCost) {
+    costPrice = num(val('f-cost'), NaN);
+    if (!isFinite(costPrice) || costPrice < 0) { setErr(body, 'f-cost', 'Enter a valid cost of 0 or more.'); ok = false; }
+    else if (costPrice > 1e8) { setErr(body, 'f-cost', 'That looks too large — check for an extra digit.'); ok = false; }
+  }
 
   const thresh = num(val('f-thresh'), NaN);
   if (!isFinite(thresh) || thresh < 0) { setErr(body, 'f-thresh', 'Enter a valid number of 0 or more.'); ok = false; }
@@ -452,6 +465,7 @@ function readItemForm(body, isEdit) {
     pack_size: packSize != null ? +packSize.toFixed(3) : null,
     pack_unit_name: packSize != null ? packUnit : '',
     ...(openQty != null ? { quantity: +openQty.toFixed(3) } : {}),
+    ...(hasCost ? { cost_price: +costPrice.toFixed(2) } : {}),
   };
 }
 
@@ -477,9 +491,11 @@ async function openItemModal(item) {
     <div class="divider"></div>
     <div class="row gap3">
       ${fieldRow('Price (Rs.)', 'f-price', { req: true, val: item ? String(item.price) : '0', decimal: true })}
+      ${S.ctx.app.can.view_profit ? fieldRow('Cost price (Rs.)', 'f-cost', { val: item ? String(item.cost_price ?? 0) : '0', decimal: true }) : ''}
       ${!isEdit ? fieldRow('Opening stock', 'f-qty', { val: '0', decimal: true }) : ''}
       ${fieldRow('Low stock alert at', 'f-thresh', { val: item ? String(item.low_stock_threshold ?? 5) : '10', decimal: true })}
     </div>
+    ${S.ctx.app.can.view_profit ? `<div class="tiny muted" style="margin-top:-10px">Cost price is only visible to the owner - it never prints on a bill and staff accounts never see it.</div>` : ''}
     ${isEdit ? `<div class="row between" style="padding:10px 12px;background:var(--surface-2);border-radius:var(--r-md)">
       <span class="small">Current stock: <b class="mono">${qty(item.quantity)} ${esc(item.unit || '')}</b></span>
       <button class="btn btn-ghost btn-sm" id="goAdjust">${icon('refresh', 14)}Adjust stock</button>

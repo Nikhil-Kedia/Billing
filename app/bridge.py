@@ -452,6 +452,10 @@ class Api:
 
         daily = [{"date": r["bill_date"], "revenue": r["revenue"], "bills": r["bills"]}
                  for r in db.get_daily_performance(cur_from_s, cur_to_s)]
+        if security.has_permission(security.PERM_VIEW_PROFIT):
+            profit_by_date = {r["bill_date"]: r["profit"] for r in db.get_daily_profit(cur_from_s, cur_to_s)}
+            for d in daily:
+                d["profit"] = profit_by_date.get(d["date"], 0)
 
         top = db.get_top_products(limit=8, date_from=cur_from_s, date_to=cur_to_s)
         top_products = [{"name": r["item_name"], "qty": r["total_qty"], "revenue": r["total_revenue"]}
@@ -464,14 +468,23 @@ class Api:
         acquisition = db.get_customer_acquisition(
             cur_from_s, cur_to_s, granularity="month" if range_key in ("month", "all") else "day")
 
+        kpis = {
+            "revenue": revenue, "revenue_delta": revenue_delta,
+            "bills": bills_n, "bills_delta": bills_delta,
+            "avg": avg, "avg_delta": avg_delta,
+            "outstanding": outstanding, "outstanding_accounts": len(outstanding_rows),
+            "low_stock": low_stock,
+        }
+        # Profit never leaves the server for a staff account - not just
+        # hidden by the UI, not present in the payload at all.
+        if security.has_permission(security.PERM_VIEW_PROFIT):
+            profit_summary = db.get_profit_summary(cur_from_s, cur_to_s)
+            prev_profit = db.get_profit_summary(prev_from_s, prev_to_s) if prev_from_s else None
+            kpis["profit"] = profit_summary["profit"] or 0
+            kpis["profit_delta"] = pct(kpis["profit"], prev_profit["profit"]) if prev_profit else None
+
         return {
-            "kpis": {
-                "revenue": revenue, "revenue_delta": revenue_delta,
-                "bills": bills_n, "bills_delta": bills_delta,
-                "avg": avg, "avg_delta": avg_delta,
-                "outstanding": outstanding, "outstanding_accounts": len(outstanding_rows),
-                "low_stock": low_stock,
-            },
+            "kpis": kpis,
             "daily": daily,
             "top_products": top_products,
             "weekday": weekday,
@@ -508,6 +521,7 @@ class Api:
         "avg_bill":    "Average bill value",
         "collected":   "Amount collected",
         "outstanding": "Outstanding",
+        "profit":      "Profit",
     }
     _REPORT_ITEM_LEVEL_X = ("product", "category")   # grouping lives in bill_items, not bills
     _REPORT_ITEM_MEASURES = ("items_sold", "quantity")  # need bill_items even for a bill-level grouping
@@ -522,8 +536,13 @@ class Api:
         # to sale-only - that would leave it with a single group and defeat
         # the point of the axis. Every other grouping follows the same
         # sale-only rule as the rest of the dashboard (see database.py's
-        # own note above get_daily_performance et al.).
-        if x != "bill_type":
+        # own note above get_daily_performance et al.). Profit is the one
+        # MEASURE that is never meaningful for a purchase line (its
+        # price_per_unit is what was paid, not charged) - even when
+        # grouping by bill_type itself, profit always stays sale-only, so
+        # picking "Profit" while grouped by "Bill type" just shows one
+        # Sale bar rather than a nonsense Purchase number.
+        if x != "bill_type" or y == "profit":
             where += " AND b.bill_type = 'sale'"
         if date_from:
             where += " AND b.bill_date >= ?"; params.append(date_from)
@@ -553,7 +572,12 @@ class Api:
         else:
             raise ValidationError("Unknown grouping.")
 
-        if y in self._REPORT_ITEM_MEASURES:
+        if y == "profit":
+            query = (f"SELECT {group_expr} AS label, "
+                     f"COALESCE(SUM((bi.price_per_unit - COALESCE(i.cost_price,0)) * bi.quantity),0) AS value "
+                     f"FROM bills b JOIN bill_items bi ON bi.bill_id = b.id "
+                     f"LEFT JOIN items i ON i.id = bi.item_id {where} GROUP BY label")
+        elif y in self._REPORT_ITEM_MEASURES:
             agg = "SUM(bi.quantity)" if y == "quantity" else "COUNT(bi.id)"
             query = (f"SELECT {group_expr} AS label, COALESCE({agg},0) AS value "
                      f"FROM bills b JOIN bill_items bi ON bi.bill_id = b.id {where} GROUP BY label")
@@ -600,9 +624,13 @@ class Api:
             joins += " LEFT JOIN items i ON i.id = bi.item_id"
             group_expr = "COALESCE(NULLIF(i.category, ''), 'Uncategorised')"
         else:
+            if y == "profit":
+                joins += " LEFT JOIN items i ON i.id = bi.item_id"
             group_expr = "bi.item_name"
 
-        if y == "revenue":
+        if y == "profit":
+            agg = "SUM((bi.price_per_unit - COALESCE(i.cost_price,0)) * bi.quantity)"
+        elif y == "revenue":
             agg = "SUM(bi.final_price)"
         elif y == "bills":
             agg = "COUNT(DISTINCT bi.bill_id)"
@@ -659,6 +687,8 @@ class Api:
             raise ValidationError("Please choose what to group by.")
         if y not in self._REPORT_Y:
             raise ValidationError("Please choose what to measure.")
+        if y == "profit":
+            security.require(security.PERM_VIEW_PROFIT)
         try:
             limit = int(spec.get("limit") or 10)
         except (TypeError, ValueError):
@@ -703,6 +733,146 @@ class Api:
         db.log_audit("dashboard.export_custom_report",
                      f"{(spec or {}).get('x')} vs {(spec or {}).get('y')} -> {os.path.basename(path)}")
         return path
+
+    # ------------------------------------------------------------ employee attendance & payroll
+    # The whole module is gated on one permission - see
+    # security.PERM_MANAGE_ATTENDANCE. It is never granted to staff (not
+    # in security._STAFF_PERMISSIONS), so app.can.manage_attendance is
+    # False for anyone but the owner and the nav item / screen simply
+    # doesn't appear for them - the same "UI never re-derives
+    # permissions" pattern as everything else in this file.
+
+    @staticmethod
+    def _valid_month(value, field_name="Month"):
+        text = (value or "").strip()
+        if len(text) == 7 and text[4] == "-" and text[:4].isdigit() and text[5:].isdigit():
+            return text
+        raise ValidationError(f"{field_name} must look like 2026-09.")
+
+    def _read_employee_form(self, data):
+        name = validation.clean_text(data.get("name"), 120, "Employee name", allow_empty=False)
+        phone = validation.phone(data.get("phone"))
+        role = validation.clean_text(data.get("role"), 60, "Role")
+        pay_type = (data.get("pay_type") or "monthly").strip().lower()
+        if pay_type not in ("monthly", "daily", "shift"):
+            raise ValidationError("Pay type must be monthly, daily or per-shift.")
+        pay_rate = validation.money(data.get("pay_rate") or 0, "Pay rate", allow_negative=False)
+        joined = validation.bill_date(data.get("joined_date"), "Joined date") if data.get("joined_date") else None
+        notes = validation.notes(data.get("notes"))
+        return name, phone, role, pay_type, pay_rate, joined, notes
+
+    @api_method
+    def employees_list(self, include_inactive=False):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        return db.get_employees(include_inactive=bool(include_inactive))
+
+    @api_method
+    def add_employee(self, data):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        name, phone, role, pay_type, pay_rate, joined, notes = self._read_employee_form(data or {})
+        employee_id = db.add_employee(name, phone, role, pay_type, pay_rate, joined, notes)
+        db.log_audit("attendance.add_employee", f"{name} ({pay_type}, {employee_id})")
+        return employee_id
+
+    @api_method
+    def update_employee(self, employee_id, data):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        existing = db.get_employee(employee_id)
+        if not existing:
+            raise ValidationError("This employee could not be found. They may have been removed.")
+        name, phone, role, pay_type, pay_rate, joined, notes = self._read_employee_form(data or {})
+        db.update_employee(employee_id, name, phone, role, pay_type, pay_rate,
+                            joined or existing.get("joined_date"), notes)
+        db.log_audit("attendance.update_employee", f"{name} ({employee_id})")
+        return True
+
+    @api_method
+    def set_employee_active(self, employee_id, active):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        db.set_employee_active(employee_id, bool(active))
+        db.log_audit("attendance.set_employee_active", f"{employee_id} -> {bool(active)}")
+        return True
+
+    @api_method
+    def attendance_month(self, period_month):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        period_month = self._valid_month(period_month)
+        return db.get_attendance_month(period_month)
+
+    @api_method
+    def mark_attendance(self, employee_id, date_str, status, shifts=None):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        date_str = validation.bill_date(date_str)
+        if status not in ("present", "absent", "half", "leave", "clear"):
+            raise ValidationError("Unknown attendance status.")
+        shift_val = None
+        if shifts is not None:
+            shift_val = validation.quantity(shifts, "Shifts", allow_zero=True)
+        db.mark_attendance(employee_id, date_str, status, shift_val)
+        return True
+
+    @api_method
+    def add_advance(self, employee_id, date_str, amount, notes=""):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        if not db.get_employee(employee_id):
+            raise ValidationError("This employee could not be found.")
+        date_str = validation.bill_date(date_str)
+        amount = validation.money(amount, "Advance amount")
+        if amount <= 0:
+            raise ValidationError("Advance amount must be more than zero.")
+        notes = validation.notes(notes)
+        advance_id = db.add_advance(employee_id, date_str, amount, notes)
+        db.log_audit("attendance.add_advance", f"employee {employee_id}: Rs.{amount}")
+        return advance_id
+
+    @api_method
+    def list_advances(self, employee_id=None, unsettled_only=False):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        return db.get_advances(employee_id, bool(unsettled_only))
+
+    @api_method
+    def delete_advance(self, advance_id):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        db.delete_advance(advance_id)
+        db.log_audit("attendance.delete_advance", str(advance_id))
+        return True
+
+    @api_method
+    def payroll_preview(self, employee_id, period_month):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        period_month = self._valid_month(period_month)
+        calc = db.compute_payroll(employee_id, period_month)
+        if calc is None:
+            raise ValidationError("This employee could not be found.")
+        return calc
+
+    @api_method
+    def finalize_payroll(self, employee_id, period_month):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        period_month = self._valid_month(period_month)
+        existing = [p for p in db.get_payroll_runs(period_month, employee_id) if p["status"] == "paid"]
+        if existing:
+            raise ValidationError(
+                "This month is already marked paid for this employee.\n\n"
+                "Nothing to recalculate - a paid payroll run is locked so the record stays reliable."
+            )
+        payroll_id = db.finalize_payroll(employee_id, period_month)
+        if payroll_id is None:
+            raise ValidationError("This employee could not be found.")
+        db.log_audit("attendance.finalize_payroll", f"employee {employee_id}, {period_month}")
+        return payroll_id
+
+    @api_method
+    def mark_payroll_paid(self, payroll_id):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        db.mark_payroll_paid(payroll_id)
+        db.log_audit("attendance.mark_payroll_paid", str(payroll_id))
+        return True
+
+    @api_method
+    def payroll_runs(self, period_month=None, employee_id=None):
+        security.require(security.PERM_MANAGE_ATTENDANCE)
+        return db.get_payroll_runs(period_month, employee_id)
 
     # ------------------------------------------------------------ snapshots
     @api_method
@@ -951,15 +1121,27 @@ class Api:
             quantity = existing["quantity"]
         else:
             quantity = 0
-        return code, name, category, unit, price, quantity, threshold, pack_size, pack_unit
+        # Cost price is owner-only data (security.PERM_VIEW_PROFIT). A
+        # staff account has PERM_MANAGE_INVENTORY (it can add/edit items
+        # day to day) but never this one, so cost_price=None here tells
+        # database.update_item()/add_item() to leave whatever cost price
+        # already exists untouched rather than accepting whatever a
+        # crafted request might send.
+        if security.has_permission(security.PERM_VIEW_PROFIT) and "cost_price" in data:
+            cost_price = validation.money(data.get("cost_price") or 0, "Cost price")
+        elif existing is not None:
+            cost_price = None
+        else:
+            cost_price = 0
+        return code, name, category, unit, price, quantity, threshold, pack_size, pack_unit, cost_price
 
     @api_method
     def add_item(self, data):
         security.require(security.PERM_MANAGE_INVENTORY)
-        code, name, category, unit, price, quantity, threshold, pack_size, pack_unit = \
+        code, name, category, unit, price, quantity, threshold, pack_size, pack_unit, cost_price = \
             self._read_item_form(data or {})
         item_id = db.add_item(code or None, name, category, unit, price, quantity, threshold,
-                              pack_size, pack_unit)
+                              pack_size, pack_unit, cost_price or 0)
         return item_id
 
     @api_method
@@ -968,10 +1150,10 @@ class Api:
         existing = db.get_item(item_id)
         if not existing:
             raise ValidationError("This item could not be found. It may have been deleted.")
-        code, name, category, unit, price, quantity, threshold, pack_size, pack_unit = \
+        code, name, category, unit, price, quantity, threshold, pack_size, pack_unit, cost_price = \
             self._read_item_form(data or {}, existing=existing)
         db.update_item(item_id, code or None, name, category, unit, price, quantity, threshold,
-                       pack_size, pack_unit)
+                       pack_size, pack_unit, cost_price)
         return True
 
     @api_method
@@ -997,7 +1179,11 @@ class Api:
 
     @api_method
     def get_items(self, search=""):
-        return db.get_all_items(search=search or None)
+        items = db.get_all_items(search=search or None)
+        if not security.has_permission(security.PERM_VIEW_PROFIT):
+            for it in items:
+                it.pop("cost_price", None)
+        return items
 
     # UI historically calls this the same thing two different ways.
     get_all_items = get_items
@@ -1215,7 +1401,7 @@ class Api:
             summary = br.apply_import(plan)
         finally:
             br.cleanup_import_source(temp)
-        db.bump("items", "customers", "bills")
+        db.bump("items", "customers", "bills", "attendance")
         parts = [f"{cat}: +{s['added']} added, {s['updated']} updated, {s['skipped']} skipped"
                  for cat, s in summary.items() if s["added"] or s["updated"] or s["skipped"]]
         db.log_audit("data.import", f"Imported from {os.path.basename(path)}: " + "; ".join(parts))

@@ -30,6 +30,7 @@ const NAV = [
   { group: 'People', items: [
     { id: 'customers', label: 'Customers', icon: 'users' },
     { id: 'insights', label: 'Customer Insights', icon: 'chart' },
+    { id: 'attendance', label: 'Attendance', icon: 'calendar', needsPerm: 'manage_attendance' },
   ]},
 ];
 
@@ -43,6 +44,7 @@ const VIEWS = {
   stock:     () => import('./views/stock.js'),
   customers: () => import('./views/customers.js'),
   insights:  () => import('./views/insights.js'),
+  attendance: () => import('./views/attendance.js'),
   settings:  () => import('./views/settings.js'),
 };
 
@@ -227,7 +229,9 @@ function render() {
 function paintNav() {
   const nav = q('#nav');
   nav.innerHTML = NAV.map(sec => {
-    const items = sec.items.filter(it => !it.needs || app.flags[it.needs] !== false);
+    const items = sec.items.filter(it =>
+      (!it.needs || app.flags[it.needs] !== false) &&
+      (!it.needsPerm || app.can[it.needsPerm] === true));
     if (!items.length) return '';
     return (sec.group ? `<div class="nav-group">${esc(sec.group)}</div>` : '<div style="height:6px"></div>')
       + items.map(it => `

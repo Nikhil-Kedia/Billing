@@ -167,3 +167,34 @@
 .signin-brand .glow2 { width: 320px; height: 320px; bottom: -110px; right: -80px;
   background: radial-gradient(circle, rgba(76,141,240,.32), transparent 70%); }
 .signin-form { flex: 1 1 auto; display: flex; align-items: center; justify-content: center; padding: 40px; }
+
+/* ---------- attendance grid ---------- */
+.at-grid { display: flex; flex-direction: column; min-width: max-content; }
+.at-row {
+  display: flex; align-items: center; padding: 4px 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+.at-row-head {
+  position: sticky; top: 0; z-index: 2; background: var(--surface);
+  border-bottom: 1px solid var(--line); padding: 6px 0;
+}
+.at-name {
+  width: 150px; flex: none; padding-right: 10px;
+  font-size: var(--t-13); font-weight: 620;
+}
+.at-cells { display: flex; gap: 3px; flex: none; }
+.at-head {
+  width: 30px; flex: none; text-align: center; line-height: 1.2;
+}
+.at-head.is-weekend { color: var(--ink-4); }
+.at-head.is-today { background: var(--accent-soft); border-radius: var(--r-sm); }
+.at-cell {
+  width: 30px; height: 30px; flex: none; padding: 0;
+  border-radius: var(--r-sm); border: 1px dashed var(--line);
+  background: transparent; cursor: pointer; user-select: none;
+  font-size: 11px; font-weight: 700; font-family: var(--mono);
+  transition: transform var(--fast) var(--ease), border-color var(--fast) var(--ease);
+}
+.at-cell:hover { border-color: var(--accent); transform: scale(1.08); z-index: 1; position: relative; }
+.at-cell.is-today { box-shadow: 0 0 0 1.5px var(--accent) inset; }
+.at-totals { width: 160px; flex: none; text-align: right; padding-left: 14px; }

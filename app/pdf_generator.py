@@ -221,6 +221,11 @@ def generate_bill_pdf(bill, output_path=None):
     store_name = db.get_setting("store_name", "Balaji Store") 
     store_contact = db.get_setting("store_contact", "")
     store_address = db.get_setting("store_address", "")
+    # GSTIN only prints when the owner has both entered it AND switched
+    # the Settings toggle on - entering it alone (e.g. while still typing
+    # it in) must never make it appear on a bill by accident.
+    store_gstin = db.get_setting("store_gstin", "").strip()
+    show_gstin = db.get_setting("show_gstin", "0") == "1"
 
     # 10mm side margins on a 210mm-wide page leaves exactly 180mm of
     # printable width, matching the table width. The bottom margin is
@@ -269,6 +274,8 @@ def generate_bill_pdf(bill, output_path=None):
         addr_contact = (addr_contact + " | " if addr_contact else "") + f"Contact: {store_contact}"
     if addr_contact:
         header_inner.append(Paragraph(esc(addr_contact), store_sub_style))
+    if show_gstin and store_gstin:
+        header_inner.append(Paragraph(f"GSTIN: {esc(store_gstin)}", store_sub_style))
     header_row = Table([[header_inner]], colWidths=[CONTENT_WIDTH])
     header_row.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
