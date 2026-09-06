@@ -194,6 +194,56 @@ def init_db():
     except sqlite3.OperationalError:
         pass
 
+    # What this sold line ACTUALLY cost, in money, worked out from the
+    # cost layers it consumed (see the cost-layer section below). NULL on
+    # every bill made before layers existed, and that is exactly what the
+    # profit queries fall back on - the item's default cost price - so
+    # old bills keep reporting the same profit they always did.
+    try:
+        cur.execute("ALTER TABLE bill_items ADD COLUMN cost_at_sale REAL")
+    except sqlite3.OperationalError:
+        pass
+
+    # ---- Cost layers (FIFO) ----
+    # An item is not one cost. A wholesaler buys the same thing at 95
+    # this month and 90 the next, and while both sit in the godown the
+    # profit on a sale depends on WHICH of them went out of the door.
+    # cost_lots is therefore the real stock ledger: one row per arrival,
+    # carrying what that batch cost and how much of it is still unsold.
+    # Sales eat the oldest layer first.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cost_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id INTEGER NOT NULL,
+            cost_price REAL NOT NULL DEFAULT 0,
+            quantity REAL NOT NULL DEFAULT 0,
+            remaining REAL NOT NULL DEFAULT 0,
+            source TEXT NOT NULL DEFAULT 'purchase',
+            bill_id INTEGER,
+            reference TEXT DEFAULT '',
+            received_date TEXT,
+            created_at TEXT,
+            FOREIGN KEY (item_id) REFERENCES items(id) ON DELETE CASCADE
+        )
+    """)
+
+    # Which layers a given sale line ate, and for how much. This is the
+    # undo journal: editing or deleting a bill hands these quantities
+    # back to the exact layers they came from, so a corrected bill can
+    # never quietly consume stock twice or lose a cheap batch forever.
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS cost_consumption (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            lot_id INTEGER,
+            item_id INTEGER NOT NULL,
+            bill_id INTEGER,
+            bill_item_id INTEGER,
+            quantity REAL NOT NULL DEFAULT 0,
+            cost_price REAL NOT NULL DEFAULT 0,
+            created_at TEXT
+        )
+    """)
+
     cur.execute("""
         CREATE TABLE IF NOT EXISTS settings (
             key TEXT PRIMARY KEY,
@@ -335,6 +385,11 @@ def init_db():
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_customer ON customer_ledger(customer_id)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_ledger_reference ON customer_ledger(reference)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_invtx_item ON inventory_transactions(item_id)")
+    # The FIFO pick runs on every sold line, so it gets its own index.
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_item_open "
+                "ON cost_lots(item_id, received_date, id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_lots_bill ON cost_lots(bill_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_consumption_bill ON cost_consumption(bill_id)")
 
     defaults = {
         "store_name": "Balaji Store",
@@ -374,8 +429,38 @@ def init_db():
     for k, v in defaults.items():
         cur.execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (k, v))
 
+    _seed_opening_cost_lots(cur)
+
     conn.commit()
     conn.close()
+
+
+def _seed_opening_cost_lots(cur):
+    """One-time: give every item that already has stock an opening cost
+    layer, so FIFO has something to sell from on the very first bill
+    after this upgrade.
+
+    Runs once, guarded by a settings flag - it is a migration, not a
+    reconciliation. Each layer is valued at whatever that item's default
+    cost price currently is (0 for an item that has never had one set),
+    which is precisely what the old profit maths used for every unit, so
+    nothing about today's numbers moves the day this lands.
+
+    Note the layer is dated 1970-01-01 rather than today: opening stock
+    is by definition the OLDEST stock in the godown, so it must be the
+    first thing FIFO reaches for, ahead of anything bought afterwards.
+    """
+    row = cur.execute("SELECT value FROM settings WHERE key='cost_layers_seeded'").fetchone()
+    if row is not None and row["value"] == "1":
+        return
+    cur.execute("""
+        INSERT INTO cost_lots (item_id, cost_price, quantity, remaining, source,
+                                bill_id, reference, received_date, created_at)
+        SELECT id, COALESCE(cost_price, 0), quantity, quantity, 'opening',
+               NULL, 'Stock on hand when cost tracking was switched on', '1970-01-01', ?
+        FROM items WHERE quantity > 0
+    """, (now_str(),))
+    cur.execute("INSERT OR REPLACE INTO settings (key, value) VALUES ('cost_layers_seeded', '1')")
 
 
 # ---------------- IN-PROCESS SNAPSHOT CACHE ----------------
@@ -489,6 +574,219 @@ def _log_inventory_transaction(cur, item_id, item_name, change_type, quantity_ch
     """, (item_id, item_name, change_type, quantity_change, resulting_quantity, reference, notes, now_str()))
 
 
+# ==================================================================
+# COST LAYERS  (what a sold unit actually cost)
+#
+# THE PROBLEM
+#
+# An item has one selling price but many cost prices. Buy 60 pieces at
+# 95 in August and 120 more at 88 in September and the godown now holds
+# two different costs; the profit on tomorrow's sale of 40 depends on
+# which of them leaves the shelf. Valuing everything at "the latest cost
+# price" - which is what a single items.cost_price column can express -
+# would silently restate the profit on stock that was already bought and
+# paid for at a different number.
+#
+# THE MODEL
+#
+#   cost_lots         one row per ARRIVAL of stock: what it cost, how
+#                     much came in, how much is still unsold.
+#   cost_consumption  one row per (sale line -> layer) pairing: the undo
+#                     journal, so editing or deleting a bill gives the
+#                     exact quantities back to the exact layers.
+#   bill_items
+#     .cost_at_sale   the money those layers came to, frozen onto the
+#                     line at the moment of sale. Every profit query
+#                     reads this one number - history can never be
+#                     restated by a later purchase or a change of
+#                     default cost.
+#
+# Oldest layer goes out first (FIFO), which for a confectionery
+# wholesaler is not an accounting preference but a description of what
+# physically happens to stock with a date printed on it.
+#
+# items.cost_price keeps its old job, just demoted: it is the DEFAULT
+# that pre-fills a purchase line and the valuation used for stock that
+# arrived without a purchase bill (opening stock, manual adjustments).
+# ==================================================================
+
+# Quantities are REAL, so every comparison against zero needs a hair of
+# tolerance or a layer can be left holding 0.0000000001 units forever.
+_QTY_EPS = 1e-9
+
+
+def _default_cost(cur, item_id):
+    row = cur.execute("SELECT cost_price FROM items WHERE id=?", (item_id,)).fetchone()
+    if row is None:
+        return 0.0
+    try:
+        return float(row["cost_price"] or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _lot_add(cur, item_id, quantity, cost_price, source="purchase",
+             reference="", received_date=None, bill_id=None):
+    """Books `quantity` units arriving at `cost_price` as a new layer."""
+    if not item_id or not quantity or quantity <= _QTY_EPS:
+        return None
+    try:
+        cost = max(0.0, float(cost_price or 0))
+    except (TypeError, ValueError):
+        cost = 0.0
+    cur.execute("""
+        INSERT INTO cost_lots (item_id, cost_price, quantity, remaining, source,
+                                bill_id, reference, received_date, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (item_id, cost, quantity, quantity, source, bill_id, reference or "",
+          received_date or now_str()[:10], now_str()))
+    return cur.lastrowid
+
+
+def _lot_consume(cur, item_id, quantity, bill_id=None, bill_item_id=None):
+    """Takes `quantity` units out of the oldest layers first and returns
+    what they cost in total.
+
+    Selling more than the layers hold is allowed and never blocks a sale
+    - this app has always permitted stock to go negative, and an item
+    that has simply never been bought THROUGH the app has no layers at
+    all. The shortfall is valued at the item's default cost price and
+    still journalled (with lot_id NULL), so the line has an honest cost
+    and undoing the bill stays symmetrical.
+    """
+    if not item_id or not quantity or quantity <= _QTY_EPS:
+        return 0.0
+    left = float(quantity)
+    total = 0.0
+    lots = cur.execute("""
+        SELECT id, cost_price, remaining FROM cost_lots
+        WHERE item_id = ? AND remaining > 0
+        ORDER BY received_date ASC, id ASC
+    """, (item_id,)).fetchall()
+
+    for lot in lots:
+        if left <= _QTY_EPS:
+            break
+        take = min(left, float(lot["remaining"]))
+        if take <= _QTY_EPS:
+            continue
+        cost = float(lot["cost_price"] or 0)
+        cur.execute("UPDATE cost_lots SET remaining = remaining - ? WHERE id=?", (take, lot["id"]))
+        cur.execute("""
+            INSERT INTO cost_consumption (lot_id, item_id, bill_id, bill_item_id,
+                                           quantity, cost_price, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (lot["id"], item_id, bill_id, bill_item_id, take, cost, now_str()))
+        total += take * cost
+        left -= take
+
+    if left > _QTY_EPS:
+        fallback = _default_cost(cur, item_id)
+        cur.execute("""
+            INSERT INTO cost_consumption (lot_id, item_id, bill_id, bill_item_id,
+                                           quantity, cost_price, created_at)
+            VALUES (NULL, ?, ?, ?, ?, ?, ?)
+        """, (item_id, bill_id, bill_item_id, left, fallback, now_str()))
+        total += left * fallback
+
+    return round(total, 4)
+
+
+def _lot_release_bill(cur, bill_id):
+    """Undoes everything this bill consumed: each quantity goes back into
+    the very layer it came from. Called before a bill is edited or
+    deleted, so the cheap batch a cancelled sale ate is available again
+    for the next real one."""
+    if not bill_id:
+        return
+    rows = cur.execute("SELECT lot_id, quantity FROM cost_consumption WHERE bill_id=?",
+                        (bill_id,)).fetchall()
+    for r in rows:
+        if r["lot_id"]:
+            cur.execute("UPDATE cost_lots SET remaining = remaining + ? WHERE id=?",
+                        (r["quantity"], r["lot_id"]))
+    cur.execute("DELETE FROM cost_consumption WHERE bill_id=?", (bill_id,))
+
+
+def _lot_drop_bill(cur, bill_id):
+    """Removes the layers a PURCHASE bill created - the stock it recorded
+    never really arrived, or the bill is being re-entered.
+
+    Anything already sold out of those layers keeps the cost it was sold
+    at: bill_items.cost_at_sale is frozen and the consumption rows are
+    only detached (lot_id -> NULL), never deleted. Yesterday's profit is
+    not up for renegotiation because today's paperwork changed."""
+    if not bill_id:
+        return
+    cur.execute("""
+        UPDATE cost_consumption SET lot_id = NULL
+        WHERE lot_id IN (SELECT id FROM cost_lots WHERE bill_id = ?)
+    """, (bill_id,))
+    cur.execute("DELETE FROM cost_lots WHERE bill_id=?", (bill_id,))
+
+
+def _apply_line_cost(cur, bill_type, bill_id, bill_item_id, item_id, quantity,
+                     unit_cost, reference="", bill_date=None):
+    """The one place a bill line meets the cost ledger.
+
+    A purchase banks a new layer at what was paid (and adopts that as the
+    item's default cost if it never had one). A sale eats the oldest
+    layers and freezes what they came to onto the line.
+    """
+    if not item_id or not quantity or quantity <= _QTY_EPS:
+        return
+    if bill_type == "purchase":
+        _lot_add(cur, item_id, quantity, unit_cost, source="purchase",
+                 reference=reference, received_date=bill_date, bill_id=bill_id)
+        # An item bought for the first time teaches the app its cost -
+        # 400-odd items are not going to get a cost price typed into
+        # Inventory by hand. A cost the owner HAS set is never
+        # overwritten: that one is their default, not ours to move.
+        cur.execute("""UPDATE items SET cost_price = ?, updated_at = ?
+                       WHERE id = ? AND COALESCE(cost_price, 0) <= 0""",
+                    (max(0.0, float(unit_cost or 0)), now_str(), item_id))
+    else:
+        line_cost = _lot_consume(cur, item_id, quantity, bill_id=bill_id,
+                                  bill_item_id=bill_item_id)
+        cur.execute("UPDATE bill_items SET cost_at_sale=? WHERE id=?", (line_cost, bill_item_id))
+
+
+def get_item_cost_layers(item_id, include_empty=False):
+    """The layers an item is holding right now, oldest first - "40 left at
+    95, 120 left at 88". Owner-only data; the bridge gates it."""
+    conn = get_connection()
+    q = "SELECT * FROM cost_lots WHERE item_id = ?"
+    if not include_empty:
+        q += " AND remaining > 0.000001"
+    q += " ORDER BY received_date ASC, id ASC"
+    rows = conn.execute(q, (item_id,)).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def get_stock_valuation():
+    """What the stock on hand is worth at what it actually cost - the sum
+    of every open layer. Reads the layers rather than
+    quantity x cost_price, so mixed-cost stock is valued honestly."""
+    conn = get_connection()
+    row = conn.execute("""
+        SELECT COALESCE(SUM(remaining * cost_price), 0) AS value,
+               COALESCE(SUM(remaining), 0) AS units,
+               COUNT(DISTINCT item_id) AS items
+        FROM cost_lots WHERE remaining > 0.000001
+    """).fetchone()
+    conn.close()
+    return dict(row)
+
+
+# The realised cost of one sold line, and the profit on it. Written once
+# here because database.py and bridge.py both report profit and must
+# never disagree: prefer what the line actually consumed, fall back to
+# the item's default cost for bills made before layers existed.
+SQL_LINE_COST = "COALESCE(bi.cost_at_sale, COALESCE(i.cost_price, 0) * bi.quantity)"
+SQL_LINE_PROFIT = f"(bi.price_per_unit * bi.quantity - {SQL_LINE_COST})"
+
+
 def get_inventory_transactions(search=None, item_id=None, date_from=None, date_to=None, limit=500):
     conn = get_connection()
     query = "SELECT * FROM inventory_transactions WHERE 1=1"
@@ -581,6 +879,8 @@ def add_item(item_code, name, category, unit, price, quantity, low_stock_thresho
     if quantity:
         _log_inventory_transaction(cur, item_id, name, "Item Created", quantity,
                                     resulting_quantity=quantity, notes="Initial stock on item creation")
+        _lot_add(cur, item_id, quantity, cost_price or 0, source="opening",
+                 reference="Opening stock", received_date="1970-01-01")
     conn.commit()
     bump("items")
     conn.close()
@@ -608,6 +908,24 @@ def update_item(item_id, item_code, name, category, unit, price, quantity, low_s
         if abs(diff) > 1e-9:
             _log_inventory_transaction(cur, item_id, name, "Manual Adjustment", diff,
                                         resulting_quantity=quantity, notes="Edited via Inventory tab")
+            if diff > 0:
+                _lot_add(cur, item_id, diff, cost_price, source="adjustment",
+                         reference="Edited via Inventory tab")
+            else:
+                _lot_consume(cur, item_id, -diff)
+
+        # Changing the DEFAULT cost re-values the layers that were only
+        # ever estimates from it - opening stock and hand adjustments -
+        # but never a purchase layer, which records what an actual bill
+        # says was actually paid. This is what makes filling in a cost
+        # price for an item that has never been bought through the app
+        # do the obvious thing: the stock already on the shelf starts
+        # being costed at the number just typed.
+        if abs(float(cost_price or 0) - float(old["cost_price"] or 0)) > 1e-9:
+            cur.execute("""UPDATE cost_lots SET cost_price = ?
+                           WHERE item_id = ? AND remaining > 0.000001
+                             AND source IN ('opening', 'adjustment')""",
+                        (max(0.0, float(cost_price or 0)), item_id))
     conn.commit()
     bump("items")
     conn.close()
@@ -619,6 +937,9 @@ def delete_item(item_id):
     if old is not None:
         _log_inventory_transaction(cur, item_id, old["name"], "Item Deleted", -old["quantity"],
                                     resulting_quantity=0, notes="Item removed from inventory")
+    cur.execute("UPDATE cost_consumption SET lot_id = NULL "
+                "WHERE lot_id IN (SELECT id FROM cost_lots WHERE item_id = ?)", (item_id,))
+    cur.execute("DELETE FROM cost_lots WHERE item_id=?", (item_id,))
     cur.execute("DELETE FROM items WHERE id=?", (item_id,))
     conn.commit()
     bump("items")
@@ -631,6 +952,16 @@ def adjust_item_stock(item_id, delta, change_type="Manual Adjustment", reference
     cur = conn.cursor()
     cur.execute("UPDATE items SET quantity = quantity + ?, updated_at=? WHERE id=?",
                 (delta, now_str(), item_id))
+    # Keep the cost ledger level with the quantity. Stock counted IN by
+    # hand has no purchase bill to price it, so it is valued at the
+    # item's default cost; stock written OFF (breakage, a correction)
+    # leaves through the oldest layer like a sale, so what remains is
+    # still costed correctly.
+    if delta > 0:
+        _lot_add(cur, item_id, delta, _default_cost(cur, item_id),
+                 source="adjustment", reference=reference or change_type)
+    elif delta < 0:
+        _lot_consume(cur, item_id, -delta)
     row = cur.execute("SELECT name, quantity FROM items WHERE id=?", (item_id,)).fetchone()
     if row is not None:
         _log_inventory_transaction(cur, item_id, row["name"], change_type, delta,
@@ -668,6 +999,11 @@ def reset_all_item_quantities():
                 resulting_quantity=0,
                 notes="Bulk reset all quantities to zero"
             )
+    # Every quantity is now zero, so nothing is left for a layer to
+    # describe. The consumption journal is detached rather than deleted,
+    # so bills already sold keep their recorded cost.
+    cur.execute("UPDATE cost_consumption SET lot_id = NULL")
+    cur.execute("DELETE FROM cost_lots")
     conn.commit()
     bump("items")
     conn.close()
@@ -697,13 +1033,33 @@ def add_customer(name, phone, address, notes=""):
     conn.close()
     return cid
 
-def update_customer(customer_id, name, phone, address, notes):
+def update_customer(customer_id, name, phone, address, notes, sync_bills=True):
+    """Saves the customer, and by default rewrites the name/phone/address
+    stored ON THEIR OWN BILLS to match.
+
+    A bill keeps its own copy of these three fields (that copy is what
+    the PDF prints, what Bill History lists and what the analytics group
+    by), so without this a corrected spelling would live on the customer
+    record while every past bill - and every reprint of one - still
+    showed the old one. Only bills already linked to this customer_id are
+    touched: a bill that was never linked to anybody is left alone.
+    """
     conn = get_connection()
-    conn.execute("UPDATE customers SET name=?, phone=?, address=?, notes=? WHERE id=?",
-                 (_upper(name), phone, _upper(address), notes, customer_id))
+    cur = conn.cursor()
+    cur.execute("UPDATE customers SET name=?, phone=?, address=?, notes=? WHERE id=?",
+                (_upper(name), phone, _upper(address), notes, customer_id))
+    bills_updated = 0
+    if sync_bills and customer_id:
+        cur.execute("""UPDATE bills SET customer_name=?, customer_phone=?, customer_address=?, updated_at=?
+                       WHERE customer_id=?""",
+                    (_upper(name), phone, _upper(address), now_str(), customer_id))
+        bills_updated = cur.rowcount or 0
     conn.commit()
     bump("customers")
+    if bills_updated:
+        bump("bills")
     conn.close()
+    return bills_updated
 
 def delete_customer(customer_id):
     conn = get_connection()
@@ -831,6 +1187,7 @@ def create_bill(customer_id, customer_name, customer_phone, customer_address,
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (bill_id, it.get("item_id"), it["item_name"], it["quantity"], it["price_per_unit"], it["final_price"],
                   it.get("pack_qty"), it.get("pack_unit_name") or "", it.get("pack_size")))
+            bill_item_id = cur.lastrowid
             if deduct_stock and it.get("item_id"):
                 cur.execute("UPDATE items SET quantity = quantity + ?, updated_at=? WHERE id=?",
                             (stock_sign * it["quantity"], now_str(), it["item_id"]))
@@ -840,6 +1197,12 @@ def create_bill(customer_id, customer_name, customer_phone, customer_address,
                     "Sale" if bill_type == "sale" else "Purchase",
                     stock_sign * it["quantity"],
                     resulting_quantity=new_qty, reference=bill_number)
+            # Costing runs whether or not stock quantities are being
+            # tracked: a shop with stock tracking off still wants to know
+            # what it made on a sale. See the cost-layer section above.
+            _apply_line_cost(cur, bill_type, bill_id, bill_item_id, it.get("item_id"),
+                             it["quantity"], it["price_per_unit"],
+                             reference=bill_number, bill_date=bill_date)
 
         # Automatically Update the Khata/Ledger. A purchase bill's
         # "customer" field is really whoever supplied the stock - the
@@ -902,6 +1265,14 @@ def update_bill(bill_id, customer_id, customer_name, customer_phone, customer_ad
                         undo_sign * oi["quantity"], resulting_quantity=new_qty, reference=bill_number,
                         notes="Old line item removed before applying edit")
 
+        # Undo this bill's cost effect before its lines are rewritten: a
+        # sale hands its consumed quantities back to the layers it took
+        # them from, a purchase takes its layers away again. Both are
+        # keyed on bill_id, so an edit that flips the bill from sale to
+        # purchase (or back) cleans up correctly either way.
+        _lot_release_bill(cur, bill_id)
+        _lot_drop_bill(cur, bill_id)
+
         cur.execute("DELETE FROM bill_items WHERE bill_id=?", (bill_id,))
 
         # Erase old ledger entries associated with this specific bill to recreate them cleanly
@@ -924,6 +1295,7 @@ def update_bill(bill_id, customer_id, customer_name, customer_phone, customer_ad
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (bill_id, it.get("item_id"), it["item_name"], it["quantity"], it["price_per_unit"], it["final_price"],
                   it.get("pack_qty"), it.get("pack_unit_name") or "", it.get("pack_size")))
+            bill_item_id = cur.lastrowid
             if it.get("item_id"):
                 cur.execute("UPDATE items SET quantity = quantity + ?, updated_at=? WHERE id=?",
                             (new_sign * it["quantity"], now_str(), it["item_id"]))
@@ -933,6 +1305,9 @@ def update_bill(bill_id, customer_id, customer_name, customer_phone, customer_ad
                     "Bill Edit (Sale)" if bill_type == "sale" else "Bill Edit (Purchase)",
                     new_sign * it["quantity"], resulting_quantity=new_qty, reference=bill_number,
                     notes="New/updated line item applied")
+            _apply_line_cost(cur, bill_type, bill_id, bill_item_id, it.get("item_id"),
+                             it["quantity"], it["price_per_unit"],
+                             reference=bill_number, bill_date=bill_date)
 
         # Recreate the Khata/Ledger entries for the updated amounts - see
         # create_bill for why a purchase writes none at all.
@@ -980,6 +1355,9 @@ def delete_all_bills(restock=True):
                             "Bill Deleted (Restock)" if bill_type == "sale" else "Bill Deleted (Purchase Reversed)",
                             undo_sign * oi["quantity"], resulting_quantity=new_qty, reference=bill_number)
 
+            _lot_release_bill(cur, bill_id)
+            _lot_drop_bill(cur, bill_id)
+
             if bill_number:
                 cur.execute("DELETE FROM customer_ledger WHERE reference = ? OR reference = ?", (bill_number, f"Payment for {bill_number}"))
 
@@ -1015,7 +1393,12 @@ def delete_bill(bill_id, restock=True):
                         cur, oi["item_id"], oi["item_name"],
                         "Bill Deleted (Restock)" if bill_type == "sale" else "Bill Deleted (Purchase Reversed)",
                         undo_sign * oi["quantity"], resulting_quantity=new_qty, reference=bill_number)
-        
+
+        # Same reversal on the cost ledger, and for the same reason -
+        # see _lot_release_bill / _lot_drop_bill.
+        _lot_release_bill(cur, bill_id)
+        _lot_drop_bill(cur, bill_id)
+
         # Remove associated ledger entries when a bill is entirely deleted
         if bill_number:
             cur.execute("DELETE FROM customer_ledger WHERE reference = ? OR reference = ?", (bill_number, f"Payment for {bill_number}"))
@@ -1842,10 +2225,10 @@ def get_profit_summary(date_from=None, date_to=None):
     """Revenue, cost and gross profit for one date window, in one pass
     so the three numbers can never disagree with each other."""
     conn = get_connection()
-    query = """
+    query = f"""
         SELECT COALESCE(SUM(bi.price_per_unit * bi.quantity), 0) AS revenue,
-               COALESCE(SUM(COALESCE(i.cost_price, 0) * bi.quantity), 0) AS cost,
-               COALESCE(SUM((bi.price_per_unit - COALESCE(i.cost_price, 0)) * bi.quantity), 0) AS profit
+               COALESCE(SUM({SQL_LINE_COST}), 0) AS cost,
+               COALESCE(SUM({SQL_LINE_PROFIT}), 0) AS profit
         FROM bill_items bi
         JOIN bills b ON bi.bill_id = b.id
         LEFT JOIN items i ON bi.item_id = i.id
@@ -1860,9 +2243,9 @@ def get_profit_summary(date_from=None, date_to=None):
 def get_daily_profit(date_from=None, date_to=None):
     """Same shape as get_daily_performance(), but profit per day."""
     conn = get_connection()
-    query = """
+    query = f"""
         SELECT b.bill_date AS bill_date,
-               COALESCE(SUM((bi.price_per_unit - COALESCE(i.cost_price, 0)) * bi.quantity), 0) AS profit
+               COALESCE(SUM({SQL_LINE_PROFIT}), 0) AS profit
         FROM bill_items bi
         JOIN bills b ON bi.bill_id = b.id
         LEFT JOIN items i ON bi.item_id = i.id

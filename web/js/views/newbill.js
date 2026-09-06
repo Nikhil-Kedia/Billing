@@ -108,7 +108,7 @@ function paint(root) {
                 <div style="text-align:center">Pack</div>
                 <div style="text-align:right">Qty</div>
                 <div style="text-align:center">Unit</div>
-                <div style="text-align:right">Price</div>
+                <div style="text-align:right" id="colPrice">Price</div>
                 <div style="text-align:right">Amount</div>
                 <div></div>
               </div>
@@ -263,6 +263,12 @@ function addRow(data = null, focusIt = false) {
     if (data.pack_qty) r.pack.value = data.pack_qty;
   }
 
+  // A brand-new row starts with Pack disabled in the markup; on a
+  // purchase it has to come up usable straight away, or the first
+  // arrow-key move into it would land on a dead cell (Pack is part of
+  // the keyboard row on a purchase - see grid()).
+  refreshPackUsable(r);
+
   renumber();
   if (focusIt) { r.code.focus(); r.el.scrollIntoView({ block: 'nearest', behavior: 'smooth' }); }
   return r;
@@ -355,7 +361,16 @@ function applyItem(r, it, { setQtyOne = false } = {}) {
   r.code.value = it.item_code || '';
   r.name.value = it.name;
   r.unit.value = it.unit || '';
-  r.price.value = it.price ?? '';          // price is always refreshed from the catalogue
+  // A sale opens at the selling price; a purchase opens at the item's
+  // DEFAULT cost price from Inventory - a starting point, not a rule.
+  // Whatever is left in this cell when the bill is saved is what that
+  // stock actually cost, and it is banked as its own cost layer, so
+  // buying the same item cheaper in bulk is just typing a different
+  // number here (see database.py's cost-layer section).
+  // cost_price is owner-only data and is absent from the payload for a
+  // staff account (bridge.get_items strips it), which correctly leaves
+  // the cell empty for them to type rather than leaking a default.
+  r.price.value = (S.billType === 'purchase' ? it.cost_price : it.price) ?? '';
   if (setQtyOne && !num(r.qtyEl.value, 0)) r.qtyEl.value = '1';
   setPack(r, it.pack_size, it.pack_unit_name);
   recalc();
@@ -370,6 +385,27 @@ function applyItem(r, it, { setQtyOne = false } = {}) {
 function focusAfterCode(r) {
   if (S.billType === 'purchase' && !r.pack.disabled) focusCell(r.pack);
   else focusCell(r.qtyEl);
+}
+
+/** Everything on screen that reads differently on a purchase bill, in
+    one place - the bill-type toggle and loading a saved bill for edit
+    both call this, so the two can never drift apart.
+
+    The money column is the same field in both directions, but on a
+    purchase it holds what was PAID rather than what is charged, so it
+    is labelled Cost there. That is also the number a purchase line
+    banks as its cost layer - see database.py's cost-layer section. */
+function applyBillTypeChrome({ withSaveButton = false } = {}) {
+  const root = S.root;
+  const purchase = S.billType === 'purchase';
+  if (withSaveButton) {
+    q('#saveBtn', root).innerHTML = `${icon('print', 16)}Save ${purchase ? 'purchase' : '&amp; Print'}`;
+  }
+  q('#lblCustomer', root).innerHTML = purchase
+    ? 'Party Name<span class="req">*</span>' : 'Customer<span class="req">*</span>';
+  q('#f-name', root).placeholder = purchase ? 'Start typing a supplier…' : 'Start typing a name…';
+  const colPrice = q('#colPrice', root);
+  if (colPrice) colPrice.textContent = purchase ? 'Cost' : 'Price';
 }
 
 function onCodeTyped(r) {
@@ -388,11 +424,13 @@ function onNameTyped(r) {
   const exact = S.byNameLc.get(t);
   if (exact) { AC.closeAC(); applyItem(r, exact); return; }
   const hits = S.items.filter(i => String(i.name).toLowerCase().includes(t)).slice(0, MAX_SUGGEST);
+  const purchase = S.billType === 'purchase';
   AC.show(r.name, hits.map(i => ({
     label: i.name,
-    sub: `${inr(i.price)}${i.quantity != null ? ' · ' + fmtQty(i.quantity) + ' left' : ''}`,
+    sub: `${inr(purchase && i.cost_price != null ? i.cost_price : i.price)}`
+       + `${i.quantity != null ? ' · ' + fmtQty(i.quantity) + ' left' : ''}`,
     value: i,
-  })), (it) => { applyItem(r, it); r.qtyEl.focus(); }, t);
+  })), (it) => { applyItem(r, it); focusAfterCode(r); }, t);
 }
 
 /* ---------- customer autocomplete ---------- */
@@ -498,7 +536,16 @@ function recalc() {
 /* ============================ the keyboard grid ============================ */
 function grid() {
   const g = [[S.f.name, S.f.phone, S.f.addr, S.f.date, S.f.time]];
-  S.rows.forEach(r => g.push([r.code, r.name, r.qtyEl, r.price]));
+  // On a purchase the Pack cell is part of the row proper: it is where
+  // the quantity is actually typed (a wholesaler buys 5 cartons, not 60
+  // pieces), so it has to be reachable by the arrow keys and sit in the
+  // Enter chain. On a sale the row is exactly what it always was -
+  // Pack there is an occasional convenience for the handful of items
+  // with a configured pack size, not part of the counter flow.
+  const purchase = S.billType === 'purchase';
+  S.rows.forEach(r => g.push(purchase
+    ? [r.code, r.name, r.pack, r.qtyEl, r.price]
+    : [r.code, r.name, r.qtyEl, r.price]));
   g.push([S.f.add], [S.f.less], [S.f.notes], [S.f.paid], [S.saveBtn]);
   return g;
 }
@@ -555,6 +602,15 @@ function enterKey(node_) {
   const row = S.rows.find(x => x.code === node_);
   if (row) { focusAfterCode(row); return true; }
 
+  // Purchase: Pack → Cost, skipping Quantity. Quantity on a purchase
+  // line is COMPUTED from the pack count (onPackTyped), so stopping
+  // there would just make the operator Enter past a number they never
+  // type. This is what completes the purchase flow the shop actually
+  // uses end to end: code → pack → cost → next line. Quantity is still
+  // one arrow key away for the odd loose-units case.
+  const packRow = S.rows.find(x => x.pack === node_);
+  if (packRow && S.billType === 'purchase') { focusCell(packRow.price); return true; }
+
   // Adjustment fields behave like Down.
   if ([S.f.add, S.f.less, S.f.notes, S.f.paid].includes(node_)) return arrow(node_, 1, 0);
 
@@ -597,10 +653,7 @@ function wire() {
   on(q('#billType', root), 'click', 'button', (e, b) => {
     qa('#billType button', root).forEach(x => x.classList.toggle('on', x === b));
     S.billType = b.dataset.t;
-    const purchase = S.billType === 'purchase';
-    q('#saveBtn', root).innerHTML = `${icon('print', 16)}Save ${purchase ? 'purchase' : '&amp; Print'}`;
-    q('#lblCustomer', root).innerHTML = purchase ? 'Party Name<span class="req">*</span>' : 'Customer<span class="req">*</span>';
-    q('#f-name', root).placeholder = purchase ? 'Start typing a supplier…' : 'Start typing a name…';
+    applyBillTypeChrome({ withSaveButton: true });
     S.rows.forEach(refreshPackUsable);
   });
   on(q('#payType', root), 'click', 'button', (e, b) => {
@@ -812,9 +865,7 @@ function preload(bill) {
   S.custId = bill.customer_id || null;
   S.billType = bill.bill_type || 'sale';
   qa('#billType button', S.root).forEach(b => b.classList.toggle('on', b.dataset.t === S.billType));
-  { const purchase = S.billType === 'purchase';
-    q('#lblCustomer', S.root).innerHTML = purchase ? 'Party Name<span class="req">*</span>' : 'Customer<span class="req">*</span>';
-    q('#f-name', S.root).placeholder = purchase ? 'Start typing a supplier…' : 'Start typing a name…'; }
+  applyBillTypeChrome();
   q('#billNo', S.root).textContent = bill.bill_number || '—';
   (bill.items || []).forEach(li => addRow({
     ...li,

@@ -13,6 +13,7 @@
    ============================================================ */
 
 import { api } from '../api.js';
+import { openCustomerModal } from '../customer-edit.js';
 import {
   q, qa, node, on, esc, icon, inr, dmy, qty, initials,
   toast, modal, emptyState, debounce,
@@ -231,7 +232,25 @@ function updateTopActions(k, cust) {
     actions.push({ label: 'Receive payment', icon: 'rupee', cls: 'btn-primary',
       onClick: () => S.ctx.go('khata', { customerId: cust.id }) });
   }
+  // This is the screen you actually sit on when looking at one person,
+  // so it is also where a wrong phone number or a misspelt name gets
+  // noticed - fixing it should not mean going back to the list and
+  // hunting for a hover-only pencil.
+  if (cust) {
+    actions.push({ label: 'Edit details', icon: 'pencil',
+      onClick: () => openCustomerModal(cust, { onSaved: onCustomerEdited }) });
+  }
   S.ctx.setActions(actions);
+}
+
+/** After an edit: pull the customer list again (the name in the left
+    rail, the sub-title and the bills all carry it) and re-render the
+    person currently open. */
+async function onCustomerEdited() {
+  const id = S.selectedId;
+  await reload();
+  if (!S) return;
+  if (id && S.byId.has(id)) selectCustomer(id);
 }
 
 /* ============================ KPI tiles ============================ */

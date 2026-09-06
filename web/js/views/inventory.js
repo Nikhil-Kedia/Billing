@@ -495,7 +495,8 @@ async function openItemModal(item) {
       ${!isEdit ? fieldRow('Opening stock', 'f-qty', { val: '0', decimal: true }) : ''}
       ${fieldRow('Low stock alert at', 'f-thresh', { val: item ? String(item.low_stock_threshold ?? 5) : '10', decimal: true })}
     </div>
-    ${S.ctx.app.can.view_profit ? `<div class="tiny muted" style="margin-top:-10px">Cost price is only visible to the owner - it never prints on a bill and staff accounts never see it.</div>` : ''}
+    ${S.ctx.app.can.view_profit ? `<div class="tiny muted" style="margin-top:-10px">Cost price is the DEFAULT for this item - it pre-fills a purchase line and values stock that arrived without a purchase bill. It is only visible to the owner: it never prints on a bill and staff accounts never see it.</div>` : ''}
+    ${isEdit && S.ctx.app.can.view_profit ? `<div id="costLayers" class="col gap2"></div>` : ''}
     ${isEdit ? `<div class="row between" style="padding:10px 12px;background:var(--surface-2);border-radius:var(--r-md)">
       <span class="small">Current stock: <b class="mono">${qty(item.quantity)} ${esc(item.unit || '')}</b></span>
       <button class="btn btn-ghost btn-sm" id="goAdjust">${icon('refresh', 14)}Adjust stock</button>
@@ -532,9 +533,52 @@ async function openItemModal(item) {
         close(null);
         openAdjustModal(item);
       });
+      if (isEdit && S.ctx.app.can.view_profit) loadCostLayers(bd, item);
     },
   });
   if (res) await reload();
+}
+
+/* ---------- what this item's stock actually cost ----------
+   The same item can sit in the godown at two or three different costs
+   at once - bought at 95 in August, at 88 in September - and the
+   program keeps each batch separately so a sale is costed against the
+   batch that actually leaves. This is that ledger, shown plainly, so
+   the number in the Cost price box above is never mistaken for "what
+   all of this stock cost me". Owner-only, like everything cost-related. */
+async function loadCostLayers(bd, item) {
+  const host = q('#costLayers', bd);
+  if (!host) return;
+  let info = null;
+  try { info = await api.item_cost_layers(item.id); }
+  catch { return; }                       // quietly absent rather than an error in a form
+  if (!host.isConnected) return;
+  const layers = info?.layers || [];
+  if (!layers.length) {
+    host.innerHTML = `<div class="tiny muted">No stock on hand to cost right now.</div>`;
+    return;
+  }
+  const one = layers.length === 1;
+  host.innerHTML = `
+    <div class="divider"></div>
+    <div class="row between">
+      <span class="overline">Stock on hand, by what it cost</span>
+      <span class="tiny muted">${one ? 'one batch' : layers.length + ' batches'} ·
+        avg ${inr(info.avg_cost)}</span>
+    </div>
+    <div class="col gap1" style="max-height:132px;overflow-y:auto">
+      ${layers.map(l => `
+        <div class="row between" style="padding:5px 8px;background:var(--surface-2);border-radius:var(--r-sm)">
+          <span class="small mono">${qty(l.remaining)} ${esc(item.unit || '')} @ ${inr(l.cost_price)}</span>
+          <span class="tiny muted ellipsis" style="max-width:52%" title="${esc(l.reference || '')}">${esc(
+            l.source === 'purchase' ? (l.reference ? 'Bill ' + l.reference : 'Purchase')
+            : l.source === 'opening' ? 'Opening stock' : 'Adjusted by hand')}</span>
+        </div>`).join('')}
+    </div>
+    <div class="row between">
+      <span class="small">Stock value at cost</span>
+      <b class="mono">${inr(info.value)}</b>
+    </div>`;
 }
 
 /* ============================ adjust stock modal ============================ */

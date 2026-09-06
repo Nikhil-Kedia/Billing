@@ -208,8 +208,14 @@ def _clean_row(raw, mapping, line_no):
         "unit": validation.unit(_cell(raw, mapping, "unit")) or "pcs",
         "price": validation.money(_cell(raw, mapping, "price") or 0,
                                   f"Price for '{name}'"),
-        "cost_price": validation.money(_cell(raw, mapping, "cost_price") or 0,
-                                       f"Cost price for '{name}'"),
+        # None (not 0) when the sheet has no cost column at all: that
+        # tells add_item/update_item "leave the cost price alone".
+        # Without this, importing an ordinary price list - which is what
+        # most of these files are - would silently wipe the cost price
+        # off every item it touched.
+        "cost_price": (validation.money(_cell(raw, mapping, "cost_price") or 0,
+                                        f"Cost price for '{name}'")
+                       if "cost_price" in mapping else None),
         "quantity": validation.quantity(_cell(raw, mapping, "quantity") or 0,
                                         f"Stock for '{name}'", allow_zero=True),
         "low_stock_threshold": validation.quantity(
@@ -331,7 +337,7 @@ def apply(plan):
                 quantity=row["quantity"],
                 low_stock_threshold=row["low_stock_threshold"],
                 pack_size=row["pack_size"], pack_unit_name=row["pack_unit_name"],
-                cost_price=row["cost_price"])
+                cost_price=row["cost_price"] or 0)
             counts["added"] += 1
         elif conflict.resolution == "overwrite":
             existing = dict(conflict.existing_row)

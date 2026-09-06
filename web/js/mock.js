@@ -308,6 +308,20 @@ export const mockApi = {
     bill_id: b.id, bill_number: b.bill_number, customer_name: b.customer_name,
     date: b.bill_date, size_kb: 60 + Math.floor(rnd() * 70), filename: b.bill_number + '.pdf', exists: true }))),
 
+  item_cost_layers: async (id) => {
+    const it = items.find(x => x.id === id) || {};
+    const half = Math.max(1, Math.round((it.quantity || 0) / 2));
+    const layers = (it.quantity || 0) <= 0 ? [] : [
+      { id: 1, item_id: id, cost_price: +( (it.cost_price || 0) * 1.06 ).toFixed(2), remaining: half,
+        source: 'purchase', reference: '00000042', received_date: '2026-07-14' },
+      { id: 2, item_id: id, cost_price: it.cost_price || 0, remaining: (it.quantity || 0) - half,
+        source: 'purchase', reference: '00000061', received_date: '2026-08-30' },
+    ];
+    const units = layers.reduce((s, l) => s + l.remaining, 0);
+    const value = layers.reduce((s, l) => s + l.remaining * l.cost_price, 0);
+    return ok({ layers, units, value: +value.toFixed(2), avg_cost: units ? +(value / units).toFixed(4) : 0 });
+  },
+  stock_valuation: async () => ok({ value: 184320, units: 4120, items: items.length }),
   get_items: async (search = '') => ok(items.filter(i => !search ||
     i.name.toLowerCase().includes(search.toLowerCase()) || i.item_code.toLowerCase().includes(search.toLowerCase()))),
   add_item: async () => ok(true), update_item: async () => ok(true), delete_item: async () => ok(true),

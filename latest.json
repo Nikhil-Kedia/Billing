@@ -1,9 +1,9 @@
 {
-  "version": "3.0.2",
+  "version": "3.0.3",
   "released": "2026-09-06",
-  "url": "https://github.com/Nikhil-Kedia/Billing/releases/download/v3.0.2/Vikray-Setup-3.0.2.exe",
-  "sha256": "a150f58c20655aeaba888a48b76c9fc334a11323909b1cfab2aa3818bb4580ca",
-  "size": 22758324,
+  "url": "https://github.com/Nikhil-Kedia/Billing/releases/download/v3.0.3/Vikray-Setup-3.0.3.exe",
+  "sha256": "6fd918993fb95ab7acb1eec15859f39ee1e4bf7ff2ccdfc398ab1461fd22cb9d",
+  "size": 22769401,
   "notes": "See the release notes on GitHub.",
   "min_version": "3.0",
   "mandatory": false

@@ -228,7 +228,8 @@ _TABLE_SCHEMA_SQL = {
     "bill_items": """CREATE TABLE bill_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT, bill_id INTEGER NOT NULL, item_id INTEGER,
             item_name TEXT NOT NULL, quantity REAL NOT NULL, price_per_unit REAL NOT NULL,
-            final_price REAL NOT NULL, pack_qty REAL, pack_unit_name TEXT DEFAULT '', pack_size REAL)""",
+            final_price REAL NOT NULL, pack_qty REAL, pack_unit_name TEXT DEFAULT '', pack_size REAL,
+            cost_at_sale REAL)""",
     "customer_ledger": """CREATE TABLE customer_ledger (
             id INTEGER PRIMARY KEY AUTOINCREMENT, customer_id INTEGER NOT NULL, transaction_date TEXT NOT NULL,
             transaction_type TEXT NOT NULL, reference TEXT DEFAULT '', debit REAL DEFAULT 0, credit REAL DEFAULT 0,
@@ -238,6 +239,20 @@ _TABLE_SCHEMA_SQL = {
             change_type TEXT NOT NULL, quantity_change REAL NOT NULL, resulting_quantity REAL,
             reference TEXT DEFAULT '', notes TEXT DEFAULT '', created_at TEXT)""",
     "settings": """CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT)""",
+    # Stock on hand, batch by batch, with what each batch cost - the
+    # thing that makes profit right when the same item was bought at
+    # two different prices. Backed up with the items themselves.
+    #
+    # cost_consumption (which sale line ate which batch) is deliberately
+    # NOT backed up: it exists only to undo a LIVE bill edit or delete,
+    # and every layer's `remaining` here is already net of it. The cost
+    # of anything already sold lives on bill_items.cost_at_sale, which
+    # is backed up, so no profit figure depends on the journal.
+    "cost_lots": """CREATE TABLE cost_lots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, item_id INTEGER NOT NULL,
+            cost_price REAL NOT NULL DEFAULT 0, quantity REAL NOT NULL DEFAULT 0,
+            remaining REAL NOT NULL DEFAULT 0, source TEXT NOT NULL DEFAULT 'purchase',
+            bill_id INTEGER, reference TEXT DEFAULT '', received_date TEXT, created_at TEXT)""",
     "employees": """CREATE TABLE employees (
             id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT DEFAULT '',
             role TEXT DEFAULT '', pay_type TEXT NOT NULL DEFAULT 'monthly', pay_rate REAL NOT NULL DEFAULT 0,
@@ -263,7 +278,7 @@ _TABLE_SCHEMA_SQL = {
 
 # Which real tables each user-facing category pulls from.
 _CATEGORY_TABLES = {
-    "items": ["items"],
+    "items": ["items", "cost_lots"],
     "customers": ["customers"],
     "bills": ["bills", "bill_items", "customer_ledger"],
     "khata": ["customer_ledger"],
@@ -320,6 +335,7 @@ def export_data(dest_path, categories):
 
     if "items" in categories:
         _copy_all(live, out, "items")
+        _copy_all(live, out, "cost_lots")
     if "customers" in categories:
         _copy_all(live, out, "customers")
     if "bills" in categories:
@@ -564,6 +580,33 @@ def scan_import(src_path, categories):
                 plan["items"].append({"row": dict(r), "conflict": c})
             else:
                 plan["items"].append({"row": dict(r), "conflict": None})
+
+    # Cost layers (what each batch of stock cost). These carry only a raw
+    # item_id, so - exactly like the attendance family below - the backup's
+    # OWN items table is what turns that id back into a name that can be
+    # matched here.
+    if "items" in categories and _table_exists(bak, "cost_lots") and _table_exists(bak, "items"):
+        bak_item_names = {r["id"]: r["name"] for r in bak.execute("SELECT id, name FROM items").fetchall()}
+        # A layer is only taken on for an item that is not already holding
+        # stock of its own here. Without this, importing a backup into a
+        # shop that has been trading would stack a second set of batches
+        # on top of the real ones and quietly double what the godown is
+        # worth. Restoring into an empty (or never-costed) item - the case
+        # that actually matters - is unaffected.
+        already_costed = set()
+        for r in live.execute("""SELECT i.name AS name FROM cost_lots cl
+                                 JOIN items i ON i.id = cl.item_id
+                                 WHERE cl.remaining > 0.000001""").fetchall():
+            already_costed.add(r["name"])
+        for raw in bak.execute("SELECT * FROM cost_lots LIMIT ?", (MAX_ROWS_PER_TABLE,)).fetchall():
+            r = dict(raw)
+            item_name = bak_item_names.get(r["item_id"])
+            if not item_name or item_name in already_costed:
+                continue
+            if (r.get("remaining") or 0) <= 0.000001:
+                continue                      # a used-up batch has nothing left to describe
+            plan["items"].append({"kind": "cost_lot", "row": r, "item_name": item_name,
+                                   "conflict": None})
 
     if "customers" in categories and _table_exists(bak, "customers"):
         for raw in bak.execute("SELECT * FROM customers LIMIT ?", (MAX_ROWS_PER_TABLE,)).fetchall():
@@ -946,8 +989,30 @@ def _apply_import_inner(conn, plan):
     customer_id_map = {}  # backup customer id -> live customer id (only for customers in THIS backup's import)
     employee_id_map = {}  # backup employee id -> live employee id (only for employees in THIS backup's import)
 
-    # Items first (bills/inventory history reference them)
+    # Items first (bills/inventory history reference them). Cost layers
+    # are queued into this same list by scan_import, always after every
+    # real item row, so item_id_map is fully populated by the time one
+    # needs to resolve the item it belongs to.
     for entry in plan["items"]:
+        if entry.get("kind") == "cost_lot":
+            row = entry["row"]
+            new_item_id = _resolve_item_id(cur, row["item_id"], entry.get("item_name"), item_id_map)
+            if new_item_id is None:
+                summary["items"]["skipped"] += 1
+                continue
+            # `remaining`, not `quantity`, is what still exists - the
+            # rest of that batch was sold before the backup was taken.
+            # bill_id is dropped: it points at a bill row in whatever
+            # database this file came from.
+            remaining = row.get("remaining") or 0
+            cur.execute("""INSERT INTO cost_lots (item_id, cost_price, quantity, remaining, source,
+                            bill_id, reference, received_date, created_at)
+                            VALUES (?,?,?,?,?,NULL,?,?,?)""",
+                        (new_item_id, row.get("cost_price") or 0, remaining, remaining,
+                         row.get("source") or "purchase", row.get("reference") or "",
+                         row.get("received_date"), row.get("created_at") or db.now_str()))
+            summary["items"]["added"] += 1
+            continue
         row, conflict = entry["row"], entry["conflict"]
         # .get() throughout: an older backup file made before the carton/
         # pack-size feature existed simply won't have these columns at
@@ -1081,10 +1146,16 @@ def _apply_import_inner(conn, plan):
             # NULL), so an unmatched item just becomes NULL - the bill
             # line still imports with its name/qty/price intact.
             new_item_id = _resolve_item_id(cur, it["item_id"], it["item_name"], item_id_map) if it["item_id"] else None
+            # cost_at_sale: what the batches this line actually consumed
+            # came to, frozen when it was sold. .get() because a backup
+            # made before cost layers existed has no such column - and
+            # NULL is exactly what the profit queries fall back on.
             cur.execute("""INSERT INTO bill_items (bill_id, item_id, item_name, quantity, price_per_unit,
-                            final_price, pack_qty, pack_unit_name, pack_size) VALUES (?,?,?,?,?,?,?,?,?)""",
+                            final_price, pack_qty, pack_unit_name, pack_size, cost_at_sale)
+                            VALUES (?,?,?,?,?,?,?,?,?,?)""",
                         (new_bill_id, new_item_id, it["item_name"], it["quantity"], it["price_per_unit"],
-                         it["final_price"], it.get("pack_qty"), it.get("pack_unit_name") or "", it.get("pack_size")))
+                         it["final_price"], it.get("pack_qty"), it.get("pack_unit_name") or "",
+                         it.get("pack_size"), it.get("cost_at_sale")))
 
         for lg in entry["ledger"]:
             # customer_ledger.customer_id is NOT NULL - _get_or_create_customer_id()

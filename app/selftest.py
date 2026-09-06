@@ -79,6 +79,20 @@ sys.modules["webview"] = fake_webview
 import bridge  # noqa: E402  (must come after the webview stub above)
 import database as db  # noqa: E402
 
+# Migrate the working copy exactly as nova.py does on every real start.
+#
+# Without this the suite ran the CURRENT bridge against a seed database
+# frozen at whatever schema it was captured with, so every feature added
+# since - cost price, attendance, cost layers - failed here with "table
+# has no column named ..." while working perfectly in the app. That is
+# the worst kind of test: red for a reason that isn't a bug, which
+# trains you to ignore it.
+#
+# Running it here is also the more faithful test: an old database being
+# opened by a new build IS the upgrade path every existing shop takes,
+# and now the suite exercises it on every run.
+db.init_db()
+
 api = bridge.Api()
 
 print(f"bridge.py loaded OK; database at {db.DB_PATH}")

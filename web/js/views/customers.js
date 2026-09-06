@@ -12,8 +12,9 @@
 
 import { api } from '../api.js';
 import * as Panels from '../panels.js';
+import { openCustomerModal as openSharedCustomerModal } from '../customer-edit.js';
 import {
-  q, qa, on, node, esc, icon, inr, dmy, initials, toast, modal, confirm,
+  q, qa, on, node, esc, icon, inr, dmy, initials, toast, confirm,
   emptyState, debounce,
 } from '../core.js';
 
@@ -235,10 +236,17 @@ function renderDetail() {
         <div class="col" id="recentBills"><div class="skel" style="height:60px"></div></div>
       </div>
 
-      <button class="btn btn-primary" style="width:100%" id="fullInsights">${icon('chart', 14)}View full insights</button>
+      <div class="row gap2">
+        <button class="btn grow" id="editCust">${icon('pencil', 14)}Edit details</button>
+        <button class="btn btn-primary grow" id="fullInsights">${icon('chart', 14)}Full insights</button>
+      </div>
     </div>`;
 
   q('#fullInsights', S.root).onclick = () => S.ctx.go('insights', { customerId: c.id });
+  // Always visible, unlike the pencil on the row itself - that one only
+  // appears on hover, which is why "there is no way to edit a customer"
+  // was a fair reading of this screen.
+  q('#editCust', S.root).onclick = () => openCustomerModal(c);
   loadRecentBills(c.id);
 }
 
@@ -299,63 +307,10 @@ function wire() {
 }
 
 /* ============================ add / edit modal ============================ */
-function fieldRow(label, id, opts = {}) {
-  return `<div class="field grow" style="${opts.style || ''}">
-    <label class="label">${esc(label)}${opts.req ? '<span class="req">*</span>' : ''}</label>
-    <input class="input" id="${id}" autocomplete="off" placeholder="${esc(opts.ph || '')}" value="${esc(opts.val ?? '')}">
-    <div class="tiny" style="color:var(--bad-ink);min-height:14px" data-err="${id}"></div>
-  </div>`;
-}
-
-function setErr(body, id, msg) {
-  const input = q('#' + id, body), err = q(`[data-err="${id}"]`, body);
-  if (input) input.classList.toggle('is-bad', !!msg);
-  if (err) err.textContent = msg || '';
-}
-
-async function openCustomerModal(cust) {
-  const isEdit = !!cust;
-  const body = node(`<div class="col gap4">
-    ${fieldRow('Customer name', 'f-name', { req: true, val: cust?.name || '' })}
-    <div class="row gap3">
-      ${fieldRow('Phone', 'f-phone', { val: cust?.phone || '', ph: '98530 21456' })}
-      ${fieldRow('Address', 'f-addr', { val: cust?.address || '', ph: 'Town, district' })}
-    </div>
-    ${isEdit ? fieldRow('Notes', 'f-notes', { val: cust?.notes || '', ph: 'Optional' }) : ''}
-  </div>`);
-
-  const res = await modal({
-    title: isEdit ? `Edit customer: ${cust.name}` : 'Add customer',
-    icon: isEdit ? 'pencil' : 'plus',
-    body,
-    actions: [
-      { label: 'Cancel', value: false },
-      {
-        label: isEdit ? 'Save changes' : 'Add customer', cls: 'btn-primary', default: true,
-        onClick: async () => {
-          setErr(body, 'f-name', '');
-          const name = q('#f-name', body).value.trim();
-          if (!name) { setErr(body, 'f-name', 'Customer name is required.'); return false; }
-          const data = {
-            name,
-            phone: q('#f-phone', body).value.trim(),
-            address: q('#f-addr', body).value.trim(),
-            ...(isEdit ? { notes: q('#f-notes', body).value.trim() } : {}),
-          };
-          try {
-            if (isEdit) await api.update_customer(cust.id, data);
-            else await api.add_customer(data);
-            toast(isEdit ? 'Customer updated' : 'Customer added', `${name} was saved.`, 'ok');
-          } catch (e) {
-            toast(isEdit ? 'Could not save customer' : 'Could not add customer', e.message, 'bad');
-            return false;
-          }
-          return true;
-        },
-      },
-    ],
-  });
-  if (res) await reload();
+/* The dialog itself now lives in js/customer-edit.js so Customer
+   Insights can open the same one - see that file for why. */
+function openCustomerModal(cust) {
+  return openSharedCustomerModal(cust, { onSaved: reload });
 }
 
 /* ============================ delete ============================ */

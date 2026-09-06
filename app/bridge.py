@@ -574,7 +574,7 @@ class Api:
 
         if y == "profit":
             query = (f"SELECT {group_expr} AS label, "
-                     f"COALESCE(SUM((bi.price_per_unit - COALESCE(i.cost_price,0)) * bi.quantity),0) AS value "
+                     f"COALESCE(SUM({db.SQL_LINE_PROFIT}),0) AS value "
                      f"FROM bills b JOIN bill_items bi ON bi.bill_id = b.id "
                      f"LEFT JOIN items i ON i.id = bi.item_id {where} GROUP BY label")
         elif y in self._REPORT_ITEM_MEASURES:
@@ -629,7 +629,7 @@ class Api:
             group_expr = "bi.item_name"
 
         if y == "profit":
-            agg = "SUM((bi.price_per_unit - COALESCE(i.cost_price,0)) * bi.quantity)"
+            agg = f"SUM({db.SQL_LINE_PROFIT})"
         elif y == "revenue":
             agg = "SUM(bi.final_price)"
         elif y == "bills":
@@ -1189,6 +1189,29 @@ class Api:
     get_all_items = get_items
 
     @api_method
+    def item_cost_layers(self, item_id):
+        """What this item is holding, batch by batch - "40 left at 95,
+        120 left at 88" - plus the money that adds up to. Owner-only:
+        this is cost data, same gate as the Cost column itself."""
+        security.require(security.PERM_VIEW_PROFIT)
+        layers = db.get_item_cost_layers(item_id)
+        value = sum((l["remaining"] or 0) * (l["cost_price"] or 0) for l in layers)
+        units = sum((l["remaining"] or 0) for l in layers)
+        return {
+            "layers": layers,
+            "units": round(units, 3),
+            "value": round(value, 2),
+            # The blended cost of what is actually on the shelf - the
+            # honest single number to quote when there are several.
+            "avg_cost": round(value / units, 4) if units > 1e-9 else 0,
+        }
+
+    @api_method
+    def stock_valuation(self):
+        security.require(security.PERM_VIEW_PROFIT)
+        return db.get_stock_valuation()
+
+    @api_method
     def reset_all_stock(self):
         if not security.has_permission(security.PERM_RESET_INVENTORY):
             db.log_audit("inventory.reset", "Blocked - insufficient permission", outcome="denied")
@@ -1271,8 +1294,13 @@ class Api:
         phone = validation.phone(data.get("phone"), required=False)
         address = validation.address(data.get("address"))
         notes = validation.notes(data["notes"]) if "notes" in data else (existing.get("notes") or "")
-        db.update_customer(customer_id, name, phone, address, notes)
-        return True
+        bills_updated = db.update_customer(customer_id, name, phone, address, notes)
+        renamed = (existing.get("name") or "").strip().upper() != (name or "").strip().upper()
+        if renamed:
+            db.log_audit("customer.rename",
+                          f"'{existing.get('name')}' renamed to '{name}' "
+                          f"({bills_updated} bill(s) updated to match)")
+        return {"bills_updated": bills_updated, "renamed": renamed}
 
     @api_method
     def delete_customer(self, customer_id):
